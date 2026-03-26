@@ -23,6 +23,12 @@ dist-ssr
 *.sln
 *.sw?
 
+# Output
+output
+
+# Conversations
+.claude/conversations
+
 # Python
 __pycache__
 *.pyc

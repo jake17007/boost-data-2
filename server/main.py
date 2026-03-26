@@ -355,6 +355,168 @@ async def add_music(
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
+CONVERSATIONS_DIR = os.path.join(PROJECT_DIR, ".claude", "conversations")
+os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
+
+
+def _conv_path(conv_id: str) -> str:
+    return os.path.join(CONVERSATIONS_DIR, f"{conv_id}.json")
+
+
+def _load_conversations() -> list[dict]:
+    convos = []
+    if os.path.isdir(CONVERSATIONS_DIR):
+        for f in os.listdir(CONVERSATIONS_DIR):
+            if f.endswith(".json"):
+                with open(os.path.join(CONVERSATIONS_DIR, f)) as fh:
+                    convos.append(json.load(fh))
+    convos.sort(key=lambda c: c.get("createdAt", 0))
+    return convos
+
+
+class ConversationUpdate(BaseModel):
+    name: str | None = None
+    sessionId: str | None = None
+    messages: list[dict] | None = None
+
+
+@app.get("/conversations")
+async def list_conversations():
+    return _load_conversations()
+
+
+@app.post("/conversations")
+async def create_conversation(body: ConversationUpdate | None = None):
+    import random, string
+    conv_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    conv = {
+        "id": conv_id,
+        "name": (body and body.name) or f"Conversation",
+        "sessionId": None,
+        "messages": [],
+        "createdAt": int(__import__("time").time() * 1000),
+    }
+    with open(_conv_path(conv_id), "w") as f:
+        json.dump(conv, f)
+    return conv
+
+
+@app.patch("/conversations/{conv_id}")
+async def update_conversation(conv_id: str, body: ConversationUpdate):
+    path = _conv_path(conv_id)
+    if not os.path.exists(path):
+        return {"error": "not found"}
+    with open(path) as f:
+        conv = json.load(f)
+    if body.name is not None:
+        conv["name"] = body.name
+    if body.sessionId is not None:
+        conv["sessionId"] = body.sessionId
+    if body.messages is not None:
+        conv["messages"] = body.messages
+    with open(path, "w") as f:
+        json.dump(conv, f)
+    return conv
+
+
+@app.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str):
+    path = _conv_path(conv_id)
+    if os.path.exists(path):
+        os.unlink(path)
+    return {"ok": True}
+
+
+@app.get("/pick-folder")
+async def pick_folder():
+    """Open a native folder picker dialog and return the selected path."""
+    script = (
+        'tell application "System Events"\n'
+        '  activate\n'
+        'end tell\n'
+        'set chosenFolder to POSIX path of (choose folder with prompt "Select output folder")\n'
+        'return chosenFolder'
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return {"path": None}
+    return {"path": stdout.decode().strip()}
+
+
+class SaveVideoRequest(BaseModel):
+    directory: str | None = None
+
+
+@app.post("/save-video")
+async def save_video(
+    file: UploadFile = File(...),
+    directory: str = Form(None),
+):
+    import time as _time
+    out_dir = directory or DEFAULT_OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    timestamp = _time.strftime("%Y%m%d_%H%M%S")
+    filename = f"video_{timestamp}.mp4"
+    dest = os.path.join(out_dir, filename)
+
+    with open(dest, "wb") as f:
+        f.write(await file.read())
+
+    return {"path": dest, "filename": filename}
+
+
+@app.get("/saved-videos")
+async def list_saved_videos(directory: str = None):
+    out_dir = directory or DEFAULT_OUTPUT_DIR
+    if not os.path.isdir(out_dir):
+        return []
+    files = sorted(
+        [f for f in os.listdir(out_dir) if f.endswith(".mp4")],
+        reverse=True,
+    )
+    return [{"filename": f, "path": os.path.join(out_dir, f)} for f in files]
+
+
+@app.get("/serve-video")
+async def serve_video(path: str):
+    if not os.path.isfile(path) or not path.endswith(".mp4"):
+        return {"error": "not found"}
+    return FileResponse(path, media_type="video/mp4")
+
+
+class AutoNameRequest(BaseModel):
+    message: str
+
+
+@app.post("/conversations/{conv_id}/auto-name")
+async def auto_name_conversation(conv_id: str, body: AutoNameRequest):
+    path = _conv_path(conv_id)
+    if not os.path.exists(path):
+        return {"error": "not found"}
+
+    result = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Generate a short title (3-5 words max) for this conversation based on the user's first message. Return ONLY the title, nothing else."},
+            {"role": "user", "content": body.message},
+        ],
+        max_tokens=20,
+    )
+    name = result.choices[0].message.content.strip().strip('"')
+
+    with open(path) as f:
+        conv = json.load(f)
+    conv["name"] = name
+    with open(path, "w") as f:
+        json.dump(conv, f)
+    return {"name": name}
 
 
 class ChatRequest(BaseModel):

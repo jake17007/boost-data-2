@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Handle, Position, useNodeId, useReactFlow } from '@xyflow/react';
-import { getNodeOutput, subscribe } from '../store';
+import { getNodeOutput, setNodeOutput, subscribe } from '../store';
 
 const DB_NAME = 'boost-workflow';
 const STORE_NAME = 'music-files';
@@ -84,7 +84,9 @@ export default function AddMusicNode() {
         throw new Error(err);
       }
       const resultBlob = await res.blob();
-      setVideoUrl(URL.createObjectURL(resultBlob));
+      const url = URL.createObjectURL(resultBlob);
+      setVideoUrl(url);
+      setNodeOutput(nodeId, { videoBlob: resultBlob, videoUrl: url });
       setStatus('done');
     } catch (err) {
       console.error('Add music failed:', err);

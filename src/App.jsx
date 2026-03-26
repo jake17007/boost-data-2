@@ -1,3 +1,4 @@
+// @refresh reset
 import { useCallback } from 'react';
 import {
   ReactFlow,
@@ -16,6 +17,8 @@ import TimeLapseNode from './nodes/TimeLapseNode';
 import RemoveSilenceNode from './nodes/RemoveSilenceNode';
 import AddCaptionsNode from './nodes/AddCaptionsNode';
 import AddMusicNode from './nodes/AddMusicNode';
+import PixelCaptionsNode from './nodes/PixelCaptionsNode';
+import SaveVideoNode from './nodes/SaveVideoNode';
 import ClaudePanel from './ClaudePanel';
 
 const nodeTypes = {
@@ -25,6 +28,8 @@ const nodeTypes = {
   removeSilence: RemoveSilenceNode,
   addCaptions: AddCaptionsNode,
   addMusic: AddMusicNode,
+  pixelCaptions: PixelCaptionsNode,
+  saveVideo: SaveVideoNode,
 };
 
 const initialNodes = [
@@ -64,6 +69,18 @@ const initialNodes = [
     position: { x: 1350, y: 600 },
     data: {},
   },
+  {
+    id: '8',
+    type: 'saveVideo',
+    position: { x: 1750, y: 600 },
+    data: {},
+  },
+  {
+    id: '7',
+    type: 'pixelCaptions',
+    position: { x: 950, y: 300 },
+    data: {},
+  },
 ];
 
 const initialEdges = [
@@ -72,6 +89,7 @@ const initialEdges = [
   { id: 'e1-4', source: '1', target: '4', animated: true },
   { id: 'e4-5', source: '4', target: '5', animated: true },
   { id: 'e5-6', source: '5', target: '6', animated: true },
+  { id: 'e6-8', source: '6', target: '8', animated: true },
 ];
 
 export default function App() {
