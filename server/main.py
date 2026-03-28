@@ -3,11 +3,14 @@ import json
 import os
 import subprocess
 import tempfile
+import audalign as ad
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
+from typing import List
+import anthropic
 
 app = FastAPI()
 
@@ -359,6 +362,28 @@ DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 CONVERSATIONS_DIR = os.path.join(PROJECT_DIR, ".claude", "conversations")
 os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
 
+WORKFLOW_PATH = os.path.join(PROJECT_DIR, ".claude", "workflow.json")
+
+
+class WorkflowUpdate(BaseModel):
+    nodes: list[dict]
+    edges: list[dict]
+
+
+@app.get("/workflow")
+async def get_workflow():
+    if os.path.isfile(WORKFLOW_PATH):
+        with open(WORKFLOW_PATH) as f:
+            return json.load(f)
+    return None
+
+
+@app.post("/workflow")
+async def save_workflow(body: WorkflowUpdate):
+    with open(WORKFLOW_PATH, "w") as f:
+        json.dump({"nodes": body.nodes, "edges": body.edges}, f)
+    return {"ok": True}
+
 
 def _conv_path(conv_id: str) -> str:
     return os.path.join(CONVERSATIONS_DIR, f"{conv_id}.json")
@@ -484,11 +509,668 @@ async def list_saved_videos(directory: str = None):
     return [{"filename": f, "path": os.path.join(out_dir, f)} for f in files]
 
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mts", ".m4v"}
+
+MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".mts": "video/mp2t",
+    ".m4v": "video/x-m4v",
+}
+
+
+@app.get("/list-videos")
+async def list_videos(directory: str):
+    """List all video files in a directory."""
+    if not os.path.isdir(directory):
+        return []
+    files = []
+    for f in sorted(os.listdir(directory)):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in VIDEO_EXTENSIONS:
+            files.append({"filename": f, "path": os.path.join(directory, f)})
+    return files
+
+
+
+def _identify_cameras(video_paths: list[str]) -> tuple[str, str]:
+    """
+    Identify which video is DJI and which is Canon based on filename or metadata.
+    Returns (dji_path, canon_path).
+    """
+    dji_path = None
+    canon_path = None
+
+    for path in video_paths:
+        fname = os.path.basename(path).upper()
+        if "DJI" in fname:
+            dji_path = path
+        elif any(tag in fname for tag in ["CANON", "MVI_", "IMG_", "EOS"]):
+            canon_path = path
+
+    # If we couldn't identify by name, try ffprobe metadata
+    if not dji_path or not canon_path:
+        for path in video_paths:
+            if path == dji_path or path == canon_path:
+                continue
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_format", path],
+                capture_output=True, text=True,
+            )
+            meta = json.loads(probe.stdout).get("format", {}).get("tags", {})
+            make = " ".join(str(v) for v in meta.values()).upper()
+            if "DJI" in make and not dji_path:
+                dji_path = path
+            elif not canon_path:
+                canon_path = path
+
+    # Fallback: first = DJI, second = Canon
+    if not dji_path and not canon_path:
+        dji_path = video_paths[0]
+        canon_path = video_paths[1]
+    elif not dji_path:
+        dji_path = [p for p in video_paths if p != canon_path][0]
+    elif not canon_path:
+        canon_path = [p for p in video_paths if p != dji_path][0]
+
+    return dji_path, canon_path
+
+
+class SyncMergeRequest(BaseModel):
+    videos: List[str]
+    directory: str | None = None
+
+
+@app.post("/sync-merge")
+async def sync_merge(req: SyncMergeRequest):
+    """
+    Sync two videos (DJI + Canon) using audalign for audio alignment,
+    then output Canon video with DJI audio. Streams progress as SSE.
+    """
+    if len(req.videos) < 2:
+        return {"error": "Need at least 2 videos"}
+
+    dji_path, canon_path = _identify_cameras(req.videos[:2])
+
+    def get_duration(path):
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True,
+        )
+        return float(probe.stdout.strip())
+
+    async def stream():
+        # Phase 1: Audio sync
+        yield f"data: {json.dumps({'phase': 'sync', 'status': 'started'})}\n\n"
+
+        rec = ad.FingerprintRecognizer()
+        rec.config.set_accuracy(3)
+        results = ad.recognize(dji_path, canon_path, recognizer=rec)
+
+        match_info = results.get("match_info", {})
+        offset = None
+        for key, info in match_info.items():
+            if info and "offset_seconds" in info and info["offset_seconds"]:
+                offset = info["offset_seconds"][0]
+                break
+
+        if offset is None:
+            yield f"data: {json.dumps({'phase': 'sync', 'status': 'error', 'error': 'Could not find audio alignment'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'phase': 'sync', 'status': 'done', 'offset': offset})}\n\n"
+
+        dji_dur = get_duration(dji_path)
+        canon_dur = get_duration(canon_path)
+
+        if offset >= 0:
+            dji_start = 0.0
+            canon_start = offset
+        else:
+            dji_start = -offset
+            canon_start = 0.0
+
+        dji_remaining = dji_dur - dji_start
+        canon_remaining = canon_dur - canon_start
+        overlap_dur = min(dji_remaining, canon_remaining)
+
+        if overlap_dur <= 0:
+            yield f"data: {json.dumps({'phase': 'encode', 'status': 'error', 'error': 'No overlapping region'})}\n\n"
+            return
+
+        # Phase 2: FFmpeg merge
+        # Try stream copy first, fall back to re-encode if it fails
+        yield f"data: {json.dumps({'phase': 'encode', 'status': 'started', 'duration': overlap_dur})}\n\n"
+
+        output_path = tempfile.mktemp(suffix="_synced.mp4")
+
+        # Try copy first (fast)
+        cmd_copy = [
+            "ffmpeg", "-y",
+            "-ss", f"{canon_start:.3f}", "-i", canon_path,
+            "-ss", f"{dji_start:.3f}", "-i", dji_path,
+            "-t", f"{overlap_dur:.3f}",
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            "-shortest",
+            output_path,
+        ]
+
+        result = subprocess.run(cmd_copy, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            # Copy failed, re-encode
+            yield f"data: {json.dumps({'phase': 'encode', 'status': 'progress', 'percent': 0, 'note': 'Re-encoding required'})}\n\n"
+
+            progress_path = tempfile.mktemp(suffix="_progress.log")
+            cmd_encode = [
+                "ffmpeg", "-y",
+                "-progress", progress_path,
+                "-ss", f"{canon_start:.3f}", "-i", canon_path,
+                "-ss", f"{dji_start:.3f}", "-i", dji_path,
+                "-t", f"{overlap_dur:.3f}",
+                "-map", "0:v",
+                "-map", "1:a",
+                "-vf", "scale=-2:1080",
+                "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                "-c:a", "aac", "-b:a", "320k",
+                "-movflags", "+faststart",
+                "-shortest",
+                output_path,
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_encode,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            last_pct = -1
+            while True:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+
+                try:
+                    with open(progress_path, "r") as f:
+                        content = f.read()
+                    for line in reversed(content.split("\n")):
+                        if line.startswith("out_time_us="):
+                            us = int(line.split("=")[1])
+                            current_sec = us / 1_000_000
+                            pct = min(100, int((current_sec / overlap_dur) * 100))
+                            if pct != last_pct:
+                                last_pct = pct
+                                yield f"data: {json.dumps({'phase': 'encode', 'status': 'progress', 'percent': pct})}\n\n"
+                            break
+                except Exception:
+                    pass
+
+                if proc.returncode is not None:
+                    break
+
+            try:
+                os.unlink(progress_path)
+            except Exception:
+                pass
+
+            if proc.returncode != 0:
+                stderr = await proc.stderr.read()
+                yield f"data: {json.dumps({'phase': 'encode', 'status': 'error', 'error': stderr.decode()[:300]})}\n\n"
+                return
+
+        import base64
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+        b64 = base64.b64encode(video_bytes).decode()
+        yield f"data: {json.dumps({'phase': 'encode', 'status': 'done', 'video_b64': b64})}\n\n"
+        os.unlink(output_path)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+
+
+class DetectSilenceRequest(BaseModel):
+    video_path: str
+    min_silence_duration: float = 0.5
+
+
+@app.get("/waveform")
+async def waveform(path: str, samples: int = 1000):
+    """Extract audio waveform peaks for visualization."""
+    import numpy as np
+    if not os.path.isfile(path):
+        return {"error": "File not found"}
+
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-i", path,
+            "-vn", "-ac", "1", "-ar", "8000",
+            "-f", "f32le", "-acodec", "pcm_f32le", "-",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return {"error": "Failed to extract audio"}
+
+    audio = np.frombuffer(proc.stdout, dtype=np.float32)
+    if len(audio) == 0:
+        return {"peaks": [], "duration": 0, "sample_rate": 8000}
+
+    # Get duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    duration = float(probe.stdout.strip())
+
+    # Downsample to requested number of peaks
+    chunk_size = max(1, len(audio) // samples)
+    peaks = []
+    for i in range(0, len(audio), chunk_size):
+        chunk = audio[i:i + chunk_size]
+        peaks.append(float(np.max(np.abs(chunk))))
+
+    # Normalize peaks to 0-1
+    max_peak = max(peaks) if peaks else 1
+    if max_peak > 0:
+        peaks = [p / max_peak for p in peaks]
+
+    return {"peaks": peaks, "duration": duration, "sample_rate": 8000}
+
+
+@app.post("/detect-silences")
+async def detect_silences(req: DetectSilenceRequest):
+    """Detect silences using Deepgram speech-to-text word timestamps."""
+    import httpx
+
+    if not os.path.isfile(req.video_path):
+        return {"error": "File not found"}
+
+    # Extract audio as wav for Deepgram
+    audio_path = tempfile.mktemp(suffix=".wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", req.video_path, "-vn", "-ac", "1", "-ar", "16000", audio_path],
+        capture_output=True, text=True,
+    )
+
+    # Get total duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", req.video_path],
+        capture_output=True, text=True,
+    )
+    total_duration = float(probe.stdout.strip())
+
+    try:
+        # Send to Deepgram
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&utt_split=0.8",
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "audio/wav",
+                },
+                content=audio_data,
+            )
+            resp.raise_for_status()
+            dg_result = resp.json()
+
+        # Extract utterances (speech segments) from Deepgram
+        utterances = dg_result.get("results", {}).get("utterances", [])
+
+        if not utterances:
+            # Fallback: try words from first alternative
+            words = (
+                dg_result.get("results", {})
+                .get("channels", [{}])[0]
+                .get("alternatives", [{}])[0]
+                .get("words", [])
+            )
+            # Group words into segments based on gaps
+            segments = []
+            if words:
+                seg_start = words[0]["start"]
+                seg_end = words[0]["end"]
+                for w in words[1:]:
+                    gap = w["start"] - seg_end
+                    if gap >= req.min_silence_duration:
+                        segments.append({"start": round(seg_start, 3), "end": round(seg_end, 3)})
+                        seg_start = w["start"]
+                    seg_end = w["end"]
+                segments.append({"start": round(seg_start, 3), "end": round(seg_end, 3)})
+        else:
+            segments = [
+                {"start": round(u["start"], 3), "end": round(u["end"], 3)}
+                for u in utterances
+            ]
+
+        return {
+            "segments": segments,
+            "total_duration": total_duration,
+        }
+    finally:
+        if os.path.exists(audio_path):
+            os.unlink(audio_path)
+
+
+class RenderTimelineRequest(BaseModel):
+    video_path: str
+    segments: list  # list of {"start": float, "end": float}
+
+
+@app.post("/render-timeline")
+async def render_timeline(req: RenderTimelineRequest):
+    """Render a video from a list of segments, streaming progress."""
+    if not os.path.isfile(req.video_path):
+        return {"error": "File not found"}
+
+    if not req.segments:
+        return {"error": "No segments provided"}
+
+    total_dur = sum(s["end"] - s["start"] for s in req.segments)
+
+    async def stream():
+        yield f"data: {json.dumps({'status': 'started', 'duration': total_dur})}\n\n"
+
+        output_path = tempfile.mktemp(suffix="_timeline.mp4")
+        progress_path = tempfile.mktemp(suffix="_progress.log")
+
+        # Build filter_complex to concat segments
+        filter_parts = []
+        for i, seg in enumerate(req.segments):
+            filter_parts.append(
+                f"[0:v]trim=start={seg['start']:.3f}:end={seg['end']:.3f},setpts=PTS-STARTPTS[v{i}];"
+                f"[0:a]atrim=start={seg['start']:.3f}:end={seg['end']:.3f},asetpts=PTS-STARTPTS[a{i}];"
+            )
+        concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(req.segments)))
+        filter_parts.append(f"{concat_inputs}concat=n={len(req.segments)}:v=1:a=1[outv][outa];")
+        filter_parts.append("[outv]scale=-2:1080[outvs]")
+        filter_complex = "".join(filter_parts)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-progress", progress_path,
+            "-i", req.video_path,
+            "-filter_complex", filter_complex,
+            "-map", "[outvs]", "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "-c:a", "aac", "-b:a", "320k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        last_pct = -1
+        while True:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                with open(progress_path, "r") as f:
+                    content = f.read()
+                for line in reversed(content.split("\n")):
+                    if line.startswith("out_time_us="):
+                        us = int(line.split("=")[1])
+                        current_sec = us / 1_000_000
+                        pct = min(100, int((current_sec / total_dur) * 100))
+                        if pct != last_pct:
+                            last_pct = pct
+                            yield f"data: {json.dumps({'status': 'progress', 'percent': pct})}\n\n"
+                        break
+            except Exception:
+                pass
+
+            if proc.returncode is not None:
+                break
+
+        try:
+            os.unlink(progress_path)
+        except Exception:
+            pass
+
+        if proc.returncode != 0:
+            stderr = await proc.stderr.read()
+            yield f"data: {json.dumps({'status': 'error', 'error': stderr.decode()[:300]})}\n\n"
+        else:
+            import base64
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+            b64 = base64.b64encode(video_bytes).decode()
+            yield f"data: {json.dumps({'status': 'done', 'video_b64': b64})}\n\n"
+            os.unlink(output_path)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class TranscribeTimestampsRequest(BaseModel):
+    video_path: str
+
+
+@app.post("/transcribe-timestamps")
+async def transcribe_timestamps(req: TranscribeTimestampsRequest):
+    """Get timestamped transcript using Deepgram."""
+    import httpx
+
+    if not os.path.isfile(req.video_path):
+        return {"error": "File not found"}
+
+    audio_path = tempfile.mktemp(suffix=".wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", req.video_path, "-vn", "-ac", "1", "-ar", "16000", audio_path],
+        capture_output=True, text=True,
+    )
+
+    try:
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&paragraphs=true&utterances=true&utt_split=0.4",
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "audio/wav",
+                },
+                content=audio_data,
+            )
+            resp.raise_for_status()
+            dg = resp.json()
+
+        # Use words to build sentence-level segments split on punctuation
+        words = (
+            dg.get("results", {})
+            .get("channels", [{}])[0]
+            .get("alternatives", [{}])[0]
+            .get("words", [])
+        )
+
+        transcript_lines = []
+        if words:
+            seg_words = []
+            seg_start = words[0]["start"]
+            for w in words:
+                seg_words.append(w["punctuated_word"] if "punctuated_word" in w else w["word"])
+                # Split on sentence-ending punctuation
+                pw = seg_words[-1]
+                if pw.endswith(('.', '!', '?', ',')) and len(seg_words) >= 3:
+                    transcript_lines.append({
+                        "start": round(seg_start, 2),
+                        "end": round(w["end"], 2),
+                        "text": " ".join(seg_words),
+                    })
+                    seg_words = []
+                    seg_start = w["end"]
+            # Remaining words
+            if seg_words:
+                transcript_lines.append({
+                    "start": round(seg_start, 2),
+                    "end": round(words[-1]["end"], 2),
+                    "text": " ".join(seg_words),
+                })
+
+        full_text = dg.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
+
+        return {
+            "lines": transcript_lines,
+            "full_text": full_text,
+        }
+    finally:
+        if os.path.exists(audio_path):
+            os.unlink(audio_path)
+
+
+class BRollRequest(BaseModel):
+    transcript_lines: list  # list of {start, end, text}
+    custom_prompt: str = ""
+    context: str = ""
+
+
+@app.post("/suggest-broll")
+async def suggest_broll(req: BRollRequest):
+    """Use Claude to suggest b-roll shots for each clip."""
+    claude = anthropic.Anthropic()
+
+    if req.custom_prompt:
+        prompt = req.custom_prompt
+    else:
+        transcript_text = "\n".join(
+            f"[{line['start']:.1f}s - {line['end']:.1f}s] {line['text']}"
+            for line in req.transcript_lines
+        )
+        prompt = f"""You are a professional video editor. Below is a timestamped transcript of a video. For each timestamped segment, suggest ONE specific b-roll shot that would visually support what's being said.
+
+Be specific and practical — describe shots that could realistically be filmed or sourced from stock footage. Include the type of shot (close-up, wide, over-the-shoulder, screen recording, etc.).
+
+Format your response as a list with one suggestion per segment, using this exact format:
+[START - END] B-roll: <your suggestion>
+
+Transcript:
+{transcript_text}
+
+{f"Additional context: {req.context}" if req.context else ""}"""
+
+    message = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = message.content[0].text
+
+    # Parse suggestions
+    suggestions = []
+    for line in response_text.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("[") and "B-roll:" in line:
+            try:
+                time_part = line.split("]")[0].strip("[")
+                broll_part = line.split("B-roll:")[1].strip()
+                times = time_part.replace("s", "").split(" - ")
+                suggestions.append({
+                    "start": float(times[0]),
+                    "end": float(times[1]),
+                    "suggestion": broll_part,
+                })
+            except (IndexError, ValueError):
+                suggestions.append({"start": 0, "end": 0, "suggestion": line})
+        elif line and not line.startswith("["):
+            suggestions.append({"start": 0, "end": 0, "suggestion": line})
+
+    return {
+        "suggestions": suggestions,
+        "raw": response_text,
+    }
+
+
+class SaveTextRequest(BaseModel):
+    content: str
+    filename: str
+    directory: str = ""
+
+
+@app.post("/save-text")
+async def save_text(req: SaveTextRequest):
+    out_dir = req.directory or DEFAULT_OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    dest = os.path.join(out_dir, req.filename)
+    with open(dest, "w") as f:
+        f.write(req.content)
+    return {"path": dest}
+
+
+@app.post("/rotate-video")
+async def rotate_video(file: UploadFile = File(...)):
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(await file.read())
+        input_path = tmp.name
+
+    output_path = input_path + "_rotated.mp4"
+
+    try:
+        # Try lossless rotation via metadata (no re-encode)
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", input_path,
+                "-c", "copy",
+                "-metadata:s:v:0", "rotate=90",
+                "-movflags", "+faststart",
+                output_path,
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            # Fallback: re-encode with high quality
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "transpose=1",
+                    "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                    "-c:a", "copy",
+                    "-movflags", "+faststart",
+                    output_path,
+                ],
+                capture_output=True, text=True, check=True,
+            )
+        return FileResponse(
+            output_path,
+            media_type="video/mp4",
+            filename="rotated.mp4",
+            background=None,
+        )
+    finally:
+        os.unlink(input_path)
+
+
 @app.get("/serve-video")
 async def serve_video(path: str):
-    if not os.path.isfile(path) or not path.endswith(".mp4"):
+    if not os.path.isfile(path):
         return {"error": "not found"}
-    return FileResponse(path, media_type="video/mp4")
+    ext = os.path.splitext(path)[1].lower()
+    mime = MIME_TYPES.get(ext, "video/mp4")
+    return FileResponse(path, media_type=mime)
 
 
 class AutoNameRequest(BaseModel):

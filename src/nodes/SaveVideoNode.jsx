@@ -1,15 +1,19 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Handle, Position, useNodeId, useReactFlow } from '@xyflow/react';
-import { getNodeOutput, subscribe } from '../store';
+import { getNodeOutput, setNodeOutput, subscribe, isNodeDisabled } from '../store';
+import { useNodeEnabled } from './useNodeEnabled';
 
 export default function SaveVideoNode() {
   const nodeId = useNodeId();
   const { getEdges } = useReactFlow();
+  const { enabled, toggle: toggleEnabled } = useNodeEnabled(nodeId);
 
   const [status, setStatus] = useState('idle');
   const [savedPath, setSavedPath] = useState(null);
   const [savedFiles, setSavedFiles] = useState([]);
-  const [directory, setDirectory] = useState('');
+  const [directory, setDirectory] = useState(() => {
+    return localStorage.getItem(`save-node-dir-${nodeId}`) || '';
+  });
   const [playingVideo, setPlayingVideo] = useState(null);
   const processedBlobRef = useRef(null);
 
@@ -43,6 +47,7 @@ export default function SaveVideoNode() {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setSavedPath(data.path);
+      setNodeOutput(nodeId, { savedPath: data.path });
       setStatus('done');
     } catch (err) {
       console.error('Save failed:', err);
@@ -53,6 +58,7 @@ export default function SaveVideoNode() {
   // Auto-trigger when upstream video blob changes
   useEffect(() => {
     const check = () => {
+      if (isNodeDisabled(nodeId)) return;
       const srcId = getSourceNodeId();
       if (!srcId) return;
       const data = getNodeOutput(srcId);
@@ -66,12 +72,13 @@ export default function SaveVideoNode() {
   }, [getSourceNodeId, saveVideo]);
 
   return (
-    <div className="save-node">
+    <div className={`save-node ${!enabled ? 'node-disabled' : ''}`}>
       <Handle type="target" position={Position.Left} />
 
       <div className="save-node-header">
         <div className="save-node-icon">💾</div>
         Save Video
+        <button className={`node-power-btn ${enabled ? 'node-power-on' : 'node-power-off'}`} onClick={toggleEnabled}>⏻</button>
       </div>
 
       <div className="save-node-body">
@@ -81,7 +88,10 @@ export default function SaveVideoNode() {
             type="text"
             placeholder="Directory (default: ./output)"
             value={directory}
-            onChange={(e) => setDirectory(e.target.value)}
+            onChange={(e) => {
+              setDirectory(e.target.value);
+              localStorage.setItem(`save-node-dir-${nodeId}`, e.target.value);
+            }}
           />
           <button
             className="save-node-browse-btn"
@@ -90,7 +100,10 @@ export default function SaveVideoNode() {
               try {
                 const res = await fetch('http://localhost:8000/pick-folder');
                 const data = await res.json();
-                if (data.path) setDirectory(data.path);
+                if (data.path) {
+                  setDirectory(data.path);
+                  localStorage.setItem(`save-node-dir-${nodeId}`, data.path);
+                }
               } catch {
                 // request failed
               }
@@ -136,18 +149,26 @@ export default function SaveVideoNode() {
         {savedFiles.length > 0 && (
           <div className="save-node-files">
             <div className="save-node-files-title">Saved videos</div>
-            {savedFiles.slice(0, 5).map((f) => (
-              <div
-                key={f.filename}
-                className="save-node-file save-node-file-clickable"
-                onClick={() => setPlayingVideo(f)}
-              >
-                {f.filename}
+            {savedFiles.map((f) => (
+              <div key={f.filename} className="save-node-file-row">
+                <div
+                  className="save-node-file save-node-file-clickable"
+                  onClick={() => setPlayingVideo(f)}
+                >
+                  {f.filename}
+                </div>
+                <button
+                  className="save-node-send-btn"
+                  title="Send to next node"
+                  onClick={() => {
+                    setSavedPath(f.path);
+                    setNodeOutput(nodeId, { savedPath: f.path });
+                  }}
+                >
+                  ➤
+                </button>
               </div>
             ))}
-            {savedFiles.length > 5 && (
-              <div className="save-node-file">...and {savedFiles.length - 5} more</div>
-            )}
           </div>
         )}
       </div>
