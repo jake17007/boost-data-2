@@ -55,6 +55,7 @@ export default function TimelineEditorNode() {
   const [renderPct, setRenderPct] = useState(0);
   const [resultUrl, setResultUrl] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
   const [padding, setPadding] = useState(() => {
     const saved = localStorage.getItem('tl-clip-padding');
     return saved !== null ? parseFloat(saved) : 0;
@@ -256,6 +257,7 @@ export default function TimelineEditorNode() {
   };
 
   const onPreviewTimeUpdate = useCallback((packedTime) => {
+    setCurrentTime(packedTime);
     if (timelineRef.current) {
       timelineRef.current.setTime(packedTime);
     }
@@ -530,6 +532,7 @@ export default function TimelineEditorNode() {
                 <button className="tl-transport-btn" onClick={togglePlay}>
                   {isPlaying ? '⏸' : '▶'}
                 </button>
+                <span className="tl-timecode">{currentTime.toFixed(2)}s / {totalKept.toFixed(2)}s</span>
                 {selectedActionId && (
                   <button className="tl-del-btn" onClick={deleteSelected}>
                     Delete clip
