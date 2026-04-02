@@ -1,0 +1,1 @@
+- [Never delete workflow.json](feedback_workflow_json.md) — contains user's custom node positions, append only

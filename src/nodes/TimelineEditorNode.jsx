@@ -70,6 +70,8 @@ export default function TimelineEditorNode() {
   });
   const [scaleWidth, setScaleWidth] = useState(100);
   const [rotation, setRotation] = useState(0);
+  const [canvasWidth, setCanvasWidth] = useState(1920);
+  const [canvasHeight, setCanvasHeight] = useState(1080);
   const [waveformPeaks, setWaveformPeaks] = useState([]);
   const [waveformDuration, setWaveformDuration] = useState(0);
   const undoStack = useRef([]);
@@ -713,6 +715,90 @@ export default function TimelineEditorNode() {
             </div>
 
             <div className="tl-modal-body">
+              {/* Top toolbar row */}
+              <div className="tl-toolbar">
+                {/* Canvas size */}
+                <div className="tl-canvas-size">
+                  <label>Canvas</label>
+                  <div className="tl-canvas-presets">
+                    {[
+                      { label: '16:9', w: 1920, h: 1080 },
+                      { label: '9:16', w: 1080, h: 1920 },
+                      { label: '1:1', w: 1080, h: 1080 },
+                      { label: '4:5', w: 1080, h: 1350 },
+                    ].map((p) => (
+                      <button
+                        key={p.label}
+                        className={`tl-canvas-preset ${canvasWidth === p.w && canvasHeight === p.h ? 'tl-canvas-preset--active' : ''}`}
+                        onClick={() => { setCanvasWidth(p.w); setCanvasHeight(p.h); }}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                  <input
+                    type="number"
+                    className="tl-canvas-input"
+                    value={canvasWidth}
+                    onChange={(e) => setCanvasWidth(parseInt(e.target.value) || 1920)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                  <span>×</span>
+                  <input
+                    type="number"
+                    className="tl-canvas-input"
+                    value={canvasHeight}
+                    onChange={(e) => setCanvasHeight(parseInt(e.target.value) || 1080)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                  <span className="tl-canvas-px">px</span>
+                </div>
+
+                {/* Rotation */}
+                <div className="tl-rotation">
+                  <label>Rotate</label>
+                  <input
+                    type="range"
+                    min="-180"
+                    max="180"
+                    step="1"
+                    value={rotation}
+                    onChange={(e) => setRotation(parseFloat(e.target.value))}
+                  />
+                  <input
+                    type="number"
+                    className="tl-rotation-input"
+                    min="-360"
+                    max="360"
+                    step="1"
+                    value={rotation}
+                    onChange={(e) => setRotation(parseFloat(e.target.value) || 0)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                  <span>°</span>
+                  <button className="tl-rotate-btn" onClick={() => setRotation((r) => (r + 90) % 360)}>
+                    ↻ 90°
+                  </button>
+                  <button className="tl-rotate-btn" onClick={() => setRotation(0)}>
+                    Reset
+                  </button>
+                </div>
+
+                {/* Clip padding */}
+                <div className="tl-padding">
+                  <label>Padding</label>
+                  <input
+                    type="range"
+                    min="-0.3"
+                    max="0.3"
+                    step="0.01"
+                    value={padding}
+                    onChange={(e) => onPaddingChange(parseFloat(e.target.value))}
+                  />
+                  <span>{padding.toFixed(2)}s</span>
+                </div>
+              </div>
+
               {/* Video preview */}
               <div className="tl-modal-preview">
                 <RemotionPreview
@@ -721,6 +807,8 @@ export default function TimelineEditorNode() {
                   segments={editorDataToSegments(editorData)}
                   onTimeUpdate={onPreviewTimeUpdate}
                   rotation={rotation}
+                  compositionWidth={canvasWidth}
+                  compositionHeight={canvasHeight}
                 />
               </div>
 
@@ -756,50 +844,6 @@ export default function TimelineEditorNode() {
                   <button onClick={() => setScaleWidth((w) => Math.min(2000, w + 20))}>+</button>
                 </div>
                 <span className="tl-autosave-indicator">auto-saved</span>
-              </div>
-
-              {/* Padding control */}
-              <div className="tl-padding">
-                <label>Clip padding</label>
-                <input
-                  type="range"
-                  min="-0.3"
-                  max="0.3"
-                  step="0.01"
-                  value={padding}
-                  onChange={(e) => onPaddingChange(parseFloat(e.target.value))}
-                />
-                <span>{padding.toFixed(2)}s</span>
-              </div>
-
-              {/* Rotation control */}
-              <div className="tl-rotation">
-                <label>Rotate</label>
-                <input
-                  type="range"
-                  min="-180"
-                  max="180"
-                  step="1"
-                  value={rotation}
-                  onChange={(e) => setRotation(parseFloat(e.target.value))}
-                />
-                <input
-                  type="number"
-                  className="tl-rotation-input"
-                  min="-360"
-                  max="360"
-                  step="1"
-                  value={rotation}
-                  onChange={(e) => setRotation(parseFloat(e.target.value) || 0)}
-                  onKeyDown={(e) => e.stopPropagation()}
-                />
-                <span>°</span>
-                <button className="tl-rotate-btn" onClick={() => setRotation((r) => (r + 90) % 360)}>
-                  ↻ 90°
-                </button>
-                <button className="tl-rotate-btn" onClick={() => setRotation(0)}>
-                  Reset
-                </button>
               </div>
 
               {/* Timeline */}
