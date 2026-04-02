@@ -1252,12 +1252,32 @@ body {
 
 .tl-zoom button:hover { background: #4b5563; }
 
+.tl-transport-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.tl-autosave-indicator {
+  font-size: 10px;
+  color: #4b5563;
+  margin-left: 8px;
+}
+
 /* Timeline editor wrapper */
 .tl-editor-wrap {
   border-radius: 6px;
   overflow: hidden;
   border: 1px solid #2d2d44;
-  height: 100px;
+  height: 180px;
+}
+
+/* Resize handle cursors — bracket style like pro editors */
+.timeline-editor-action .timeline-editor-action-left-stretch {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='24' viewBox='0 0 16 24'%3E%3Cpath d='M10 2H6v20h4v-2H8V4h2z' fill='white' stroke='black' stroke-width='0.5'/%3E%3C/svg%3E") 8 12, e-resize !important;
+}
+
+.timeline-editor-action .timeline-editor-action-right-stretch {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='24' viewBox='0 0 16 24'%3E%3Cpath d='M6 2h4v20H6v-2h2V4H6z' fill='white' stroke='black' stroke-width='0.5'/%3E%3C/svg%3E") 8 12, w-resize !important;
 }
 
 /* Custom action rendering inside timeline library */
@@ -1265,15 +1285,30 @@ body {
   position: relative;
   width: 100%;
   height: 100%;
-  background: linear-gradient(135deg, #6366f1 0%, #818cf8 100%);
-  border-radius: 3px;
+  background: linear-gradient(180deg, #8285f8 0%, #6366f1 30%, #4f52d0 70%, #3a3db0 100%);
+  border-radius: 5px;
   cursor: pointer;
   overflow: hidden;
+  border-top: 2px solid rgba(255, 255, 255, 0.25);
+  border-left: 1.5px solid rgba(255, 255, 255, 0.15);
+  border-right: 1.5px solid rgba(0, 0, 0, 0.5);
+  border-bottom: 2px solid rgba(0, 0, 0, 0.6);
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.5),
+    0 4px 8px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2);
 }
 
 .tl-action--sel {
-  outline: 2px solid #c084fc;
-  outline-offset: -1px;
+  background: linear-gradient(180deg, #9295fb 0%, #7578f5 30%, #6063d8 70%, #4a4dc0 100%);
+  border-top: 2px solid rgba(255, 255, 255, 0.35);
+  box-shadow:
+    0 0 0 1.5px rgba(100, 180, 255, 0.6),
+    0 2px 6px rgba(0, 0, 0, 0.5),
+    0 4px 10px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2);
 }
 
 .tl-action-label {
@@ -1356,6 +1391,55 @@ body {
   text-align: right;
 }
 
+.tl-rotation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.tl-rotation label {
+  white-space: nowrap;
+}
+
+.tl-rotation input[type="range"] {
+  flex: 1;
+  accent-color: #6366f1;
+}
+
+.tl-rotation-input {
+  width: 50px;
+  background: #1f2937;
+  border: 1px solid #374151;
+  color: #e5e7eb;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 11px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-rotation-input:focus {
+  outline: 1px solid #6366f1;
+  border-color: #6366f1;
+}
+
+.tl-rotate-btn {
+  background: #374151;
+  border: none;
+  color: #e5e7eb;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tl-rotate-btn:hover {
+  background: #4b5563;
+}
+
 /* Timeline modal */
 .tl-modal-overlay {
   position: fixed;
@@ -1396,6 +1480,21 @@ body {
   font-size: 11px;
   font-weight: 400;
   color: #6b7280;
+}
+
+.tl-header-btn {
+  background: #374151;
+  border: 1px solid #2d2d44;
+  color: #9ca3af;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tl-header-btn:hover {
+  background: #4b5563;
+  color: #d1d5db;
 }
 
 .tl-modal-close {

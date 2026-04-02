@@ -8,7 +8,26 @@ const FPS = 30;
  * Each segment is a Sequence with an OffthreadVideo trimmed to the right range.
  * trimBefore = start frame in source, trimAfter = end frame in source.
  */
-const SegmentedVideo = ({ videoUrl, segments, fps }) => {
+const VideoWithRotation = ({ children, rotation }) => {
+  if (!rotation) return children;
+  return (
+    <AbsoluteFill style={{
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+    }}>
+      <div style={{
+        transform: `rotate(${rotation}deg)`,
+        width: '100%',
+        height: '100%',
+      }}>
+        {children}
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+const SegmentedVideo = ({ videoUrl, segments, fps, rotation }) => {
   let position = 0;
 
   return (
@@ -22,12 +41,14 @@ const SegmentedVideo = ({ videoUrl, segments, fps }) => {
 
         return (
           <Sequence key={i} from={from} durationInFrames={durationFrames} premountFor={60}>
-            <OffthreadVideo
-              src={videoUrl}
-              trimBefore={trimBefore}
-              trimAfter={trimAfter}
-              pauseWhenBuffering
-            />
+            <VideoWithRotation rotation={rotation}>
+              <OffthreadVideo
+                src={videoUrl}
+                trimBefore={trimBefore}
+                trimAfter={trimAfter}
+                pauseWhenBuffering
+              />
+            </VideoWithRotation>
           </Sequence>
         );
       })}
@@ -35,15 +56,17 @@ const SegmentedVideo = ({ videoUrl, segments, fps }) => {
   );
 };
 
-const SimpleVideo = ({ videoUrl }) => {
+const SimpleVideo = ({ videoUrl, rotation }) => {
   return (
     <AbsoluteFill style={{ background: '#000' }}>
-      <OffthreadVideo src={videoUrl} pauseWhenBuffering />
+      <VideoWithRotation rotation={rotation}>
+        <OffthreadVideo src={videoUrl} pauseWhenBuffering />
+      </VideoWithRotation>
     </AbsoluteFill>
   );
 };
 
-const RemotionPreview = forwardRef(({ videoUrl, segments, onTimeUpdate }, ref) => {
+const RemotionPreview = forwardRef(({ videoUrl, segments, onTimeUpdate, rotation }, ref) => {
   const playerRef = useRef(null);
 
   // Memoize segments by value (not reference) to prevent Player re-renders
@@ -86,8 +109,10 @@ const RemotionPreview = forwardRef(({ videoUrl, segments, onTimeUpdate }, ref) =
   const hasSegments = stableSegments?.length > 0;
 
   const inputProps = useMemo(
-    () => hasSegments ? { videoUrl, segments: stableSegments, fps: FPS } : { videoUrl },
-    [hasSegments, videoUrl, stableSegments]
+    () => hasSegments
+      ? { videoUrl, segments: stableSegments, fps: FPS, rotation }
+      : { videoUrl, rotation },
+    [hasSegments, videoUrl, stableSegments, rotation]
   );
 
   return (

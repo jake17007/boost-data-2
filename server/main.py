@@ -404,6 +404,26 @@ def _get_db():
             kind TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS timeline_edits (
+            node_id TEXT PRIMARY KEY,
+            video_path TEXT,
+            editor_data TEXT NOT NULL DEFAULT '[]',
+            rotation REAL NOT NULL DEFAULT 0,
+            padding REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS timeline_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            editor_data TEXT NOT NULL,
+            rotation REAL NOT NULL DEFAULT 0,
+            padding REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
     conn.commit()
     return conn
 
@@ -527,6 +547,104 @@ async def save_workflow(body: WorkflowUpdate):
     db.commit()
     db.close()
     return {"ok": True}
+
+
+# ── Timeline Edit Persistence ──────────────────────────────────────────────────
+
+class TimelineSaveRequest(BaseModel):
+    node_id: str
+    video_path: Optional[str] = None
+    editor_data: list
+    rotation: float = 0
+    padding: float = 0
+
+
+@app.post("/timeline/save")
+async def timeline_save(req: TimelineSaveRequest):
+    """Save timeline edit state and create a version snapshot."""
+    db = _get_db()
+    data_json = json.dumps(req.editor_data)
+
+    # Upsert current state
+    db.execute("""
+        INSERT INTO timeline_edits (node_id, video_path, editor_data, rotation, padding, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(node_id) DO UPDATE SET
+            video_path = excluded.video_path,
+            editor_data = excluded.editor_data,
+            rotation = excluded.rotation,
+            padding = excluded.padding,
+            updated_at = datetime('now')
+    """, (req.node_id, req.video_path, data_json, req.rotation, req.padding))
+
+    # Save version (keep last 100 per node)
+    db.execute("""
+        INSERT INTO timeline_versions (node_id, editor_data, rotation, padding)
+        VALUES (?, ?, ?, ?)
+    """, (req.node_id, data_json, req.rotation, req.padding))
+
+    # Prune old versions
+    db.execute("""
+        DELETE FROM timeline_versions WHERE node_id = ? AND id NOT IN (
+            SELECT id FROM timeline_versions WHERE node_id = ? ORDER BY id DESC LIMIT 100
+        )
+    """, (req.node_id, req.node_id))
+
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/timeline/load")
+async def timeline_load(node_id: str):
+    """Load the latest saved timeline edit state."""
+    db = _get_db()
+    row = db.execute(
+        "SELECT video_path, editor_data, rotation, padding FROM timeline_edits WHERE node_id = ?",
+        (node_id,)
+    ).fetchone()
+    db.close()
+
+    if not row:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "video_path": row["video_path"],
+        "editor_data": json.loads(row["editor_data"]),
+        "rotation": row["rotation"],
+        "padding": row["padding"],
+    }
+
+
+@app.get("/timeline/versions")
+async def timeline_versions(node_id: str, limit: int = 20):
+    """List version history for a timeline node."""
+    db = _get_db()
+    rows = db.execute(
+        "SELECT id, created_at, rotation, padding FROM timeline_versions WHERE node_id = ? ORDER BY id DESC LIMIT ?",
+        (node_id, limit)
+    ).fetchall()
+    db.close()
+    return [{"id": r["id"], "created_at": r["created_at"], "rotation": r["rotation"], "padding": r["padding"]} for r in rows]
+
+
+@app.get("/timeline/version")
+async def timeline_version(version_id: int):
+    """Load a specific version."""
+    db = _get_db()
+    row = db.execute(
+        "SELECT editor_data, rotation, padding FROM timeline_versions WHERE id = ?",
+        (version_id,)
+    ).fetchone()
+    db.close()
+    if not row:
+        return {"error": "Version not found"}
+    return {
+        "editor_data": json.loads(row["editor_data"]),
+        "rotation": row["rotation"],
+        "padding": row["padding"],
+    }
 
 
 def _conv_path(conv_id: str) -> str:
@@ -1107,15 +1225,16 @@ class DetectSilenceRequest(BaseModel):
 
 @app.get("/waveform")
 async def waveform(path: str, samples: int = 1000):
-    """Extract audio waveform peaks for visualization."""
+    """Extract audio waveform min/max pairs for visualization (like Ableton/Premiere)."""
     import numpy as np
     if not os.path.isfile(path):
         return {"error": "File not found"}
 
+    # Higher sample rate for better detail
     proc = subprocess.run(
         [
             "ffmpeg", "-i", path,
-            "-vn", "-ac", "1", "-ar", "8000",
+            "-vn", "-ac", "1", "-ar", "22050",
             "-f", "f32le", "-acodec", "pcm_f32le", "-",
         ],
         capture_output=True,
@@ -1125,7 +1244,7 @@ async def waveform(path: str, samples: int = 1000):
 
     audio = np.frombuffer(proc.stdout, dtype=np.float32)
     if len(audio) == 0:
-        return {"peaks": [], "duration": 0, "sample_rate": 8000}
+        return {"peaks": [], "duration": 0, "sample_rate": 22050}
 
     # Get duration
     probe = subprocess.run(
@@ -1135,19 +1254,19 @@ async def waveform(path: str, samples: int = 1000):
     )
     duration = float(probe.stdout.strip())
 
-    # Downsample to requested number of peaks
+    # Min/max pairs per block (the pro technique)
     chunk_size = max(1, len(audio) // samples)
     peaks = []
     for i in range(0, len(audio), chunk_size):
         chunk = audio[i:i + chunk_size]
-        peaks.append(float(np.max(np.abs(chunk))))
+        peaks.append([float(np.min(chunk)), float(np.max(chunk))])
 
-    # Normalize peaks to 0-1
-    max_peak = max(peaks) if peaks else 1
-    if max_peak > 0:
-        peaks = [p / max_peak for p in peaks]
+    # Normalize to -1..1
+    abs_max = max(max(abs(p[0]), abs(p[1])) for p in peaks) if peaks else 1
+    if abs_max > 0:
+        peaks = [[p[0] / abs_max, p[1] / abs_max] for p in peaks]
 
-    return {"peaks": peaks, "duration": duration, "sample_rate": 8000}
+    return {"peaks": peaks, "duration": duration, "sample_rate": 22050}
 
 
 @app.post("/detect-silences")
