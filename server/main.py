@@ -1,6 +1,8 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import audalign as ad
@@ -9,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import anthropic
 
 app = FastAPI()
@@ -19,6 +21,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
 )
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -86,9 +89,10 @@ async def timelapse(file: UploadFile = File(...)):
                 "-filter_complex",
                 f"[0:v]{video_filter}[v];[0:a]{audio_filter}[a]",
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "fast",
+                "-c:v", "libx264", "-preset", "fast", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
                 "-c:a", "aac",
-                "-movflags", "+faststart",
+                "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                 output_path,
             ],
             capture_output=True, text=True, check=True,
@@ -159,7 +163,8 @@ async def remove_silence(file: UploadFile = File(...)):
             # No silence detected, return original as mp4
             subprocess.run(
                 ["ffmpeg", "-y", "-i", input_path, "-c:v", "libx264",
-                 "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart",
+                 "-preset", "fast", "-c:a", "aac", "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                  output_path],
                 capture_output=True, text=True, check=True,
             )
@@ -197,9 +202,10 @@ async def remove_silence(file: UploadFile = File(...)):
                 "ffmpeg", "-y", "-i", input_path,
                 "-filter_complex", filter_complex,
                 "-map", "[outv]", "-map", "[outa]",
-                "-c:v", "libx264", "-preset", "fast",
+                "-c:v", "libx264", "-preset", "fast", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
                 "-c:a", "aac",
-                "-movflags", "+faststart",
+                "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                 output_path,
             ],
             capture_output=True, text=True, check=True,
@@ -271,9 +277,10 @@ async def add_captions(file: UploadFile = File(...)):
             [
                 "ffmpeg", "-y", "-i", input_path,
                 "-vf", f"subtitles={escaped_srt}",
-                "-c:v", "libx264", "-preset", "fast",
+                "-c:v", "libx264", "-preset", "fast", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
                 "-c:a", "aac",
-                "-movflags", "+faststart",
+                "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                 output_path,
             ],
             capture_output=True, text=True, check=True,
@@ -339,7 +346,8 @@ async def add_music(
                 "-map", "0:v", "-map", "[outa]",
                 "-c:v", "copy",
                 "-c:a", "aac",
-                "-movflags", "+faststart",
+                "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                 "-shortest",
                 output_path,
             ],
@@ -362,7 +370,78 @@ DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 CONVERSATIONS_DIR = os.path.join(PROJECT_DIR, ".claude", "conversations")
 os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
 
-WORKFLOW_PATH = os.path.join(PROJECT_DIR, ".claude", "workflow.json")
+## ── SQLite workflow database ─────────────────────────────────────────
+
+DB_PATH = os.path.join(PROJECT_DIR, "workflow.db")
+
+
+def _get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nodes (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            position_x REAL NOT NULL DEFAULT 0,
+            position_y REAL NOT NULL DEFAULT 0,
+            data TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS edges (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            source_handle TEXT,
+            target_handle TEXT,
+            animated INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deleted_items (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _migrate_workflow_json():
+    """One-time migration from workflow.json to SQLite."""
+    old_path = os.path.join(PROJECT_DIR, ".claude", "workflow.json")
+    if not os.path.isfile(old_path):
+        return
+    db = _get_db()
+    # Only migrate if DB is empty
+    count = db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    if count > 0:
+        db.close()
+        return
+    with open(old_path) as f:
+        data = json.load(f)
+    for n in data.get("nodes", []):
+        pos = n.get("position", {})
+        db.execute(
+            "INSERT OR IGNORE INTO nodes (id, type, position_x, position_y, data) VALUES (?, ?, ?, ?, ?)",
+            (n["id"], n["type"], pos.get("x", 0), pos.get("y", 0), json.dumps(n.get("data", {}))),
+        )
+    for e in data.get("edges", []):
+        db.execute(
+            "INSERT OR IGNORE INTO edges (id, source, target, source_handle, target_handle, animated) VALUES (?, ?, ?, ?, ?, ?)",
+            (e["id"], e["source"], e["target"], e.get("sourceHandle"), e.get("targetHandle"), 1 if e.get("animated", True) else 0),
+        )
+    db.commit()
+    db.close()
+    # Rename old file so migration doesn't re-run
+    os.rename(old_path, old_path + ".bak")
+
+
+# Run migration on startup
+_migrate_workflow_json()
+# Ensure tables exist
+_get_db().close()
 
 
 class WorkflowUpdate(BaseModel):
@@ -372,16 +451,81 @@ class WorkflowUpdate(BaseModel):
 
 @app.get("/workflow")
 async def get_workflow():
-    if os.path.isfile(WORKFLOW_PATH):
-        with open(WORKFLOW_PATH) as f:
-            return json.load(f)
-    return None
+    db = _get_db()
+    nodes = []
+    for row in db.execute("SELECT id, type, position_x, position_y, data FROM nodes").fetchall():
+        nodes.append({
+            "id": row["id"],
+            "type": row["type"],
+            "position": {"x": row["position_x"], "y": row["position_y"]},
+            "data": json.loads(row["data"]),
+        })
+    edges = []
+    for row in db.execute("SELECT id, source, target, source_handle, target_handle, animated FROM edges").fetchall():
+        edge = {
+            "id": row["id"],
+            "source": row["source"],
+            "target": row["target"],
+            "animated": bool(row["animated"]),
+        }
+        if row["source_handle"]:
+            edge["sourceHandle"] = row["source_handle"]
+        if row["target_handle"]:
+            edge["targetHandle"] = row["target_handle"]
+        edges.append(edge)
+    deleted = [row["id"] for row in db.execute("SELECT id FROM deleted_items").fetchall()]
+    db.close()
+    if not nodes:
+        return None
+    return {"nodes": nodes, "edges": edges, "deleted": deleted}
 
 
 @app.post("/workflow")
 async def save_workflow(body: WorkflowUpdate):
-    with open(WORKFLOW_PATH, "w") as f:
-        json.dump({"nodes": body.nodes, "edges": body.edges}, f)
+    db = _get_db()
+    # Upsert nodes — also clear from deleted_items if re-added
+    incoming_node_ids = set()
+    for n in body.nodes:
+        pos = n.get("position", {})
+        incoming_node_ids.add(n["id"])
+        db.execute(
+            "INSERT INTO nodes (id, type, position_x, position_y, data) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET type=excluded.type, position_x=excluded.position_x, position_y=excluded.position_y, data=excluded.data",
+            (n["id"], n["type"], pos.get("x", 0), pos.get("y", 0), json.dumps(n.get("data", {}))),
+        )
+        db.execute("DELETE FROM deleted_items WHERE id = ?", (n["id"],))
+    # Track and delete nodes that were removed by the user
+    if incoming_node_ids:
+        placeholders = ",".join("?" for _ in incoming_node_ids)
+        removed_nodes = db.execute(
+            f"SELECT id FROM nodes WHERE id NOT IN ({placeholders})", list(incoming_node_ids)
+        ).fetchall()
+        for row in removed_nodes:
+            db.execute("INSERT OR IGNORE INTO deleted_items (id, kind) VALUES (?, 'node')", (row["id"],))
+        db.execute(f"DELETE FROM nodes WHERE id NOT IN ({placeholders})", list(incoming_node_ids))
+
+    # Upsert edges — also clear from deleted_items if re-added
+    incoming_edge_ids = set()
+    for e in body.edges:
+        incoming_edge_ids.add(e["id"])
+        db.execute(
+            "INSERT INTO edges (id, source, target, source_handle, target_handle, animated) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET source=excluded.source, target=excluded.target, source_handle=excluded.source_handle, target_handle=excluded.target_handle, animated=excluded.animated",
+            (e["id"], e["source"], e["target"], e.get("sourceHandle"), e.get("targetHandle"), 1 if e.get("animated", True) else 0),
+        )
+        db.execute("DELETE FROM deleted_items WHERE id = ?", (e["id"],))
+    # Track and delete edges that were removed by the user
+    if incoming_edge_ids:
+        placeholders = ",".join("?" for _ in incoming_edge_ids)
+        removed_edges = db.execute(
+            f"SELECT id FROM edges WHERE id NOT IN ({placeholders})", list(incoming_edge_ids)
+        ).fetchall()
+        for row in removed_edges:
+            db.execute("INSERT OR IGNORE INTO deleted_items (id, kind) VALUES (?, 'edge')", (row["id"],))
+        db.execute(f"DELETE FROM edges WHERE id NOT IN ({placeholders})", list(incoming_edge_ids))
+
+    db.commit()
+    db.close()
     return {"ok": True}
 
 
@@ -474,6 +618,27 @@ async def pick_folder():
     return {"path": stdout.decode().strip()}
 
 
+@app.get("/pick-file")
+async def pick_file():
+    """Open a native file picker dialog and return the selected file path."""
+    script = (
+        'tell application "System Events"\n'
+        '  activate\n'
+        'end tell\n'
+        'set chosenFile to POSIX path of (choose file with prompt "Select a video file" of type {"public.movie", "public.mpeg-4", "com.apple.quicktime-movie"})\n'
+        'return chosenFile'
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return {"path": None}
+    return {"path": stdout.decode().strip()}
+
+
 class SaveVideoRequest(BaseModel):
     directory: str | None = None
 
@@ -529,6 +694,8 @@ async def list_videos(directory: str):
         return []
     files = []
     for f in sorted(os.listdir(directory)):
+        if f.startswith('.'):
+            continue
         ext = os.path.splitext(f)[1].lower()
         if ext in VIDEO_EXTENSIONS:
             files.append({"filename": f, "path": os.path.join(directory, f)})
@@ -659,6 +826,7 @@ async def sync_merge(req: SyncMergeRequest):
             "-map", "1:a",
             "-c:v", "copy",
             "-c:a", "copy",
+            "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
             "-movflags", "+faststart",
             "-shortest",
             output_path,
@@ -680,17 +848,18 @@ async def sync_merge(req: SyncMergeRequest):
                 "-map", "0:v",
                 "-map", "1:a",
                 "-vf", "scale=-2:1080",
-                "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "320k",
-                "-movflags", "+faststart",
+                "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                 "-shortest",
                 output_path,
             ]
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd_encode,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
 
             last_pct = -1
@@ -724,9 +893,199 @@ async def sync_merge(req: SyncMergeRequest):
                 pass
 
             if proc.returncode != 0:
-                stderr = await proc.stderr.read()
-                yield f"data: {json.dumps({'phase': 'encode', 'status': 'error', 'error': stderr.decode()[:300]})}\n\n"
+                yield f"data: {json.dumps({'phase': 'encode', 'status': 'error', 'error': 'FFmpeg encoding failed'})}\n\n"
                 return
+
+        import base64
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+        b64 = base64.b64encode(video_bytes).decode()
+        yield f"data: {json.dumps({'phase': 'encode', 'status': 'done', 'video_b64': b64})}\n\n"
+        os.unlink(output_path)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class ReelMergeRequest(BaseModel):
+    videos: List[str]
+    directory: str | None = None
+
+
+def _identify_dji_and_screen(video_paths: list[str]) -> tuple[str, str]:
+    """
+    Identify which video is DJI and which is a screen recording.
+    Returns (dji_path, screen_path).
+    """
+    dji_path = None
+    screen_path = None
+
+    for path in video_paths:
+        fname = os.path.basename(path).upper()
+        if "DJI" in fname:
+            dji_path = path
+        elif any(tag in fname for tag in ["SCREEN", "RECORDING", "CAPTURE", "DISPLAY"]):
+            screen_path = path
+
+    # Try ffprobe metadata for DJI
+    if not dji_path or not screen_path:
+        for path in video_paths:
+            if path == dji_path or path == screen_path:
+                continue
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_format", "-show_streams", path],
+                capture_output=True, text=True,
+            )
+            data = json.loads(probe.stdout)
+            meta = data.get("format", {}).get("tags", {})
+            make = " ".join(str(v) for v in meta.values()).upper()
+            if "DJI" in make and not dji_path:
+                dji_path = path
+            elif not screen_path:
+                screen_path = path
+
+    # Fallback
+    if not dji_path and not screen_path:
+        dji_path = video_paths[0]
+        screen_path = video_paths[1]
+    elif not dji_path:
+        dji_path = [p for p in video_paths if p != screen_path][0]
+    elif not screen_path:
+        screen_path = [p for p in video_paths if p != dji_path][0]
+
+    return dji_path, screen_path
+
+
+@app.post("/sync-merge-reel")
+async def sync_merge_reel(req: ReelMergeRequest):
+    """
+    Sync DJI + screen recording via audio, then stack them vertically
+    (screen on top, DJI on bottom) in 9:16 (1080x1920) using DJI audio.
+    """
+    if len(req.videos) < 2:
+        return {"error": "Need at least 2 videos"}
+
+    dji_path, screen_path = _identify_dji_and_screen(req.videos[:2])
+
+    def get_duration(path):
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True,
+        )
+        return float(probe.stdout.strip())
+
+    async def stream():
+        # Phase 1: Audio sync
+        yield f"data: {json.dumps({'phase': 'sync', 'status': 'started'})}\n\n"
+
+        rec = ad.FingerprintRecognizer()
+        rec.config.set_accuracy(3)
+        results = ad.recognize(dji_path, screen_path, recognizer=rec)
+
+        match_info = results.get("match_info", {})
+        offset = None
+        for key, info in match_info.items():
+            if info and "offset_seconds" in info and info["offset_seconds"]:
+                offset = info["offset_seconds"][0]
+                break
+
+        if offset is None:
+            yield f"data: {json.dumps({'phase': 'sync', 'status': 'error', 'error': 'Could not find audio alignment'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'phase': 'sync', 'status': 'done', 'offset': offset})}\n\n"
+
+        dji_dur = get_duration(dji_path)
+        screen_dur = get_duration(screen_path)
+
+        if offset >= 0:
+            dji_start = 0.0
+            screen_start = offset
+        else:
+            dji_start = -offset
+            screen_start = 0.0
+
+        dji_remaining = dji_dur - dji_start
+        screen_remaining = screen_dur - screen_start
+        overlap_dur = min(dji_remaining, screen_remaining)
+
+        if overlap_dur <= 0:
+            yield f"data: {json.dumps({'phase': 'encode', 'status': 'error', 'error': 'No overlapping region'})}\n\n"
+            return
+
+        # Phase 2: FFmpeg encode — stack vertically in 9:16, DJI audio
+        yield f"data: {json.dumps({'phase': 'encode', 'status': 'started', 'duration': overlap_dur})}\n\n"
+
+        output_path = tempfile.mktemp(suffix="_reel.mp4")
+        progress_path = tempfile.mktemp(suffix="_progress.log")
+
+        # Screen recording on top (input 0), DJI on bottom (input 1)
+        # Each gets half of 1920 height = 960px, width = 1080
+        filter_complex = (
+            "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2:black,setsar=1[top];"
+            "[1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bot];"
+            "[top][bot]vstack=inputs=2,setsar=1[outv]"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-progress", progress_path,
+            "-ss", f"{screen_start:.3f}", "-i", screen_path,
+            "-ss", f"{dji_start:.3f}", "-i", dji_path,
+            "-t", f"{overlap_dur:.3f}",
+            "-dn",
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "320k",
+            "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
+            "-max_muxing_queue_size", "4096",
+            "-shortest",
+            output_path,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        last_pct = -1
+        while True:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                with open(progress_path, "r") as f:
+                    content = f.read()
+                for line in reversed(content.split("\n")):
+                    if line.startswith("out_time_us="):
+                        us = int(line.split("=")[1])
+                        current_sec = us / 1_000_000
+                        pct = min(100, int((current_sec / overlap_dur) * 100))
+                        if pct != last_pct:
+                            last_pct = pct
+                            yield f"data: {json.dumps({'phase': 'encode', 'status': 'progress', 'percent': pct})}\n\n"
+                        break
+            except Exception:
+                pass
+
+            if proc.returncode is not None:
+                break
+
+        try:
+            os.unlink(progress_path)
+        except Exception:
+            pass
+
+        if proc.returncode != 0:
+            yield f"data: {json.dumps({'phase': 'encode', 'status': 'error', 'error': 'FFmpeg encoding failed'})}\n\n"
+            return
 
         import base64
         with open(output_path, "rb") as f:
@@ -900,7 +1259,7 @@ async def render_timeline(req: RenderTimelineRequest):
             )
         concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(req.segments)))
         filter_parts.append(f"{concat_inputs}concat=n={len(req.segments)}:v=1:a=1[outv][outa];")
-        filter_parts.append("[outv]scale=-2:1080[outvs]")
+        filter_parts.append("[outv]setsar=1[outvs]")
         filter_complex = "".join(filter_parts)
 
         cmd = [
@@ -909,16 +1268,17 @@ async def render_timeline(req: RenderTimelineRequest):
             "-i", req.video_path,
             "-filter_complex", filter_complex,
             "-map", "[outvs]", "-map", "[outa]",
-            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "320k",
+            "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
             "-movflags", "+faststart",
             output_path,
         ]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
 
         last_pct = -1
@@ -952,8 +1312,7 @@ async def render_timeline(req: RenderTimelineRequest):
             pass
 
         if proc.returncode != 0:
-            stderr = await proc.stderr.read()
-            yield f"data: {json.dumps({'status': 'error', 'error': stderr.decode()[:300]})}\n\n"
+            yield f"data: {json.dumps({'status': 'error', 'error': 'FFmpeg encoding failed'})}\n\n"
         else:
             import base64
             with open(output_path, "rb") as f:
@@ -1121,6 +1480,507 @@ async def save_text(req: SaveTextRequest):
     return {"path": dest}
 
 
+class SuggestTitlesRequest(BaseModel):
+    transcript_lines: list  # [{start, end, text}]
+    interval: float = 5.0
+    video_duration: float = 60.0
+
+
+@app.post("/suggest-titles")
+async def suggest_titles(req: SuggestTitlesRequest):
+    """Use Claude to suggest short reel titles from transcript at intervals."""
+    claude = anthropic.Anthropic()
+
+    transcript_text = "\n".join(
+        f"[{line['start']:.1f}s - {line['end']:.1f}s] {line['text']}"
+        for line in req.transcript_lines
+    )
+
+    prompt = f"""You are a professional short-form video editor creating titles for a Reel/TikTok.
+
+Below is a timestamped transcript of a video that is {req.video_duration:.0f} seconds long. Generate short, punchy title cards that appear every ~{req.interval:.0f} seconds throughout the video.
+
+Rules:
+- Each title should be 1-5 words max
+- Titles should be engaging, attention-grabbing hooks or key points
+- They should relate to what's being said at that moment
+- Cover the full duration of the video
+- Each title displays for the full {req.interval:.0f} seconds (from its start to start + {req.interval:.0f})
+- Default position: x=0.5 (centered), y=0.33 (upper third)
+
+Return ONLY a JSON array, no other text. Each item must have: start (float seconds), end (float seconds), text (string), x (float 0-1 horizontal), y (float 0-1 vertical).
+
+Example:
+[{{"start": 0.0, "end": {req.interval:.1f}, "text": "WATCH THIS", "x": 0.5, "y": 0.15}}, {{"start": {req.interval:.1f}, "end": {req.interval * 2:.1f}, "text": "Game Changer", "x": 0.5, "y": 0.15}}]
+
+Transcript:
+{transcript_text}"""
+
+    message = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = message.content[0].text.strip()
+
+    # Parse JSON response
+    try:
+        # Find JSON array in response
+        start_idx = response_text.index("[")
+        end_idx = response_text.rindex("]") + 1
+        titles = json.loads(response_text[start_idx:end_idx])
+    except (ValueError, json.JSONDecodeError):
+        titles = []
+
+    return {"titles": titles}
+
+
+class RenderTitlesRequest(BaseModel):
+    video_path: str
+    titles: list  # [{start, end, text, position, fontSize, fontColor}]
+
+
+@app.post("/render-titles")
+async def render_titles(req: RenderTitlesRequest):
+    """Render titles onto video using ffmpeg drawtext filters."""
+    if not os.path.isfile(req.video_path):
+        return {"error": "File not found"}
+
+    if not req.titles:
+        return {"error": "No titles provided"}
+
+    # Get video duration for progress
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", req.video_path],
+        capture_output=True, text=True,
+    )
+    total_dur = float(probe.stdout.strip())
+
+    async def stream():
+        yield f"data: {json.dumps({'status': 'started', 'duration': total_dur})}\n\n"
+
+        output_path = tempfile.mktemp(suffix="_titles.mp4")
+        progress_path = tempfile.mktemp(suffix="_progress.log")
+
+        # Build drawtext filter chain
+        drawtext_filters = []
+        for t in req.titles:
+            text = t["text"].replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
+            font_size = t.get("fontSize", 72)
+            font_color = t.get("fontColor", "white")
+            x = t.get("x", 0.5)
+            y = t.get("y", 0.15)
+
+            # x/y are normalized 0-1, centered on the text
+            x_expr = f"w*{x:.4f}-text_w/2"
+            y_expr = f"h*{y:.4f}-text_h/2"
+
+            drawtext_filters.append(
+                f"drawtext=text='{text}'"
+                f":fontsize={font_size}"
+                f":fontcolor={font_color}"
+                f":borderw=4:bordercolor=black"
+                f":x={x_expr}:y={y_expr}"
+                f":enable='between(t,{t['start']:.3f},{t['end']:.3f})'"
+            )
+
+        vf = ",".join(drawtext_filters)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-progress", progress_path,
+            "-i", req.video_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        last_pct = -1
+        while True:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                with open(progress_path, "r") as f:
+                    content = f.read()
+                for line in reversed(content.split("\n")):
+                    if line.startswith("out_time_us="):
+                        us = int(line.split("=")[1])
+                        current_sec = us / 1_000_000
+                        pct = min(100, int((current_sec / total_dur) * 100))
+                        if pct != last_pct:
+                            last_pct = pct
+                            yield f"data: {json.dumps({'status': 'progress', 'percent': pct})}\n\n"
+                        break
+            except Exception:
+                pass
+
+            if proc.returncode is not None:
+                break
+
+        try:
+            os.unlink(progress_path)
+        except Exception:
+            pass
+
+        if proc.returncode != 0:
+            yield f"data: {json.dumps({'status': 'error', 'error': 'FFmpeg encoding failed'})}\n\n"
+        else:
+            import base64
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+            b64 = base64.b64encode(video_bytes).decode()
+            yield f"data: {json.dumps({'status': 'done', 'video_b64': b64})}\n\n"
+            os.unlink(output_path)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+## ── B-Roll Placer endpoints ──────────────────────────────────────────
+
+
+class AnalyzeBRollRequest(BaseModel):
+    directory: str
+
+
+@app.post("/analyze-broll-clips")
+async def analyze_broll_clips(req: AnalyzeBRollRequest):
+    """Extract frames from each clip and use Claude Vision to describe them."""
+    if not os.path.isdir(req.directory):
+        return {"error": "Directory not found"}
+
+    # Collect video files
+    clips = []
+    for f in sorted(os.listdir(req.directory)):
+        if f.startswith('.'):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext in VIDEO_EXTENSIONS:
+            clips.append({"filename": f, "path": os.path.join(req.directory, f)})
+
+    if not clips:
+        return {"error": "No video files found in directory"}
+
+    claude = anthropic.Anthropic()
+    analyses = []
+
+    async def stream():
+        yield f"data: {json.dumps({'status': 'started', 'total': len(clips)})}\n\n"
+
+        for idx, clip in enumerate(clips):
+            yield f"data: {json.dumps({'status': 'analyzing', 'index': idx, 'filename': clip['filename']})}\n\n"
+
+            # Get duration via ffprobe
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", clip["path"]],
+                capture_output=True, text=True,
+            )
+            duration = 0.0
+            try:
+                info = json.loads(probe.stdout)
+                duration = float(info["format"]["duration"])
+            except Exception:
+                pass
+
+            # Extract frames every 2 seconds
+            frames_dir = tempfile.mkdtemp(prefix="broll_frames_")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", clip["path"],
+                        "-vf", "fps=0.5,scale=512:-1",
+                        "-q:v", "5",
+                        os.path.join(frames_dir, "frame_%04d.jpg"),
+                    ],
+                    capture_output=True, text=True,
+                )
+
+                # Collect frame images as base64
+                import base64 as b64mod
+                frame_files = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
+                if not frame_files:
+                    analyses.append({
+                        "filename": clip["filename"],
+                        "duration": duration,
+                        "description": "Could not extract frames",
+                        "segments": [],
+                    })
+                    continue
+
+                # Build vision content: all frames with timestamps
+                content_parts = [{"type": "text", "text": f"These are frames extracted every 2 seconds from a video clip named '{clip['filename']}' ({duration:.1f}s long). Describe what is shown in the clip overall and for each frame. Be specific about the visual content (subjects, actions, setting, camera angle). Return a JSON object with this format:\n{{\"description\": \"overall description\", \"segments\": [{{\"time\": 0.0, \"description\": \"what this frame shows\"}}]}}"}]
+
+                for fi, frame_file in enumerate(frame_files):
+                    frame_path = os.path.join(frames_dir, frame_file)
+                    with open(frame_path, "rb") as fp:
+                        frame_b64 = b64mod.b64encode(fp.read()).decode()
+                    content_parts.append({"type": "text", "text": f"Frame at {fi * 2.0:.1f}s:"})
+                    content_parts.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64},
+                    })
+
+                # Call Claude Vision
+                message = claude.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": content_parts}],
+                )
+
+                response_text = message.content[0].text
+                # Parse JSON from response
+                try:
+                    # Find JSON in the response
+                    json_start = response_text.index("{")
+                    json_end = response_text.rindex("}") + 1
+                    parsed = json.loads(response_text[json_start:json_end])
+                    analyses.append({
+                        "filename": clip["filename"],
+                        "duration": duration,
+                        "description": parsed.get("description", ""),
+                        "segments": parsed.get("segments", []),
+                    })
+                except (ValueError, json.JSONDecodeError):
+                    analyses.append({
+                        "filename": clip["filename"],
+                        "duration": duration,
+                        "description": response_text,
+                        "segments": [],
+                    })
+
+            finally:
+                # Clean up frames
+                import shutil
+                shutil.rmtree(frames_dir, ignore_errors=True)
+
+        yield f"data: {json.dumps({'status': 'done', 'analyses': analyses})}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class MatchBRollRequest(BaseModel):
+    suggestions: list  # [{start, end, suggestion}]
+    analyses: list     # [{filename, duration, description, segments}]
+
+
+@app.post("/match-broll-clips")
+async def match_broll_clips(req: MatchBRollRequest):
+    """Use Claude to match b-roll suggestions to analyzed clips."""
+    claude = anthropic.Anthropic()
+
+    suggestions_text = "\n".join(
+        f"  {i}. [{s['start']:.1f}s - {s['end']:.1f}s] {s['suggestion']}"
+        for i, s in enumerate(req.suggestions)
+    )
+
+    clips_text = "\n".join(
+        f"  Clip: {a['filename']} ({a['duration']:.1f}s) — {a['description']}\n"
+        + "".join(f"    At {seg['time']:.1f}s: {seg['description']}\n" for seg in a.get('segments', []))
+        for a in req.analyses
+    )
+
+    prompt = f"""You are a professional video editor. Match each b-roll suggestion to the best available clip based on visual content.
+
+B-ROLL SUGGESTIONS (what we need):
+{suggestions_text}
+
+AVAILABLE CLIPS (what we have):
+{clips_text}
+
+For each suggestion, pick the clip whose visual content best matches what's described. Also choose the best start offset within that clip (where the most relevant content begins).
+
+Return a JSON array with one entry per suggestion:
+[
+  {{"index": 0, "matched_clip": "filename.mp4", "clip_start_offset": 2.0, "reason": "brief reason"}},
+  ...
+]
+
+If no clip is a good match for a suggestion, set matched_clip to null and clip_start_offset to 0. Return ONLY the JSON array."""
+
+    message = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = message.content[0].text
+
+    # Parse JSON
+    try:
+        json_start = response_text.index("[")
+        json_end = response_text.rindex("]") + 1
+        matches = json.loads(response_text[json_start:json_end])
+    except (ValueError, json.JSONDecodeError):
+        return {"error": "Failed to parse Claude response", "raw": response_text}
+
+    # Merge match info with suggestion info
+    assignments = []
+    for m in matches:
+        idx = m.get("index", 0)
+        if idx < len(req.suggestions):
+            s = req.suggestions[idx]
+            assignments.append({
+                "index": idx,
+                "start": s["start"],
+                "end": s["end"],
+                "suggestion": s["suggestion"],
+                "matched_clip": m.get("matched_clip"),
+                "clip_start_offset": m.get("clip_start_offset", 0),
+                "reason": m.get("reason", ""),
+            })
+
+    return {"assignments": assignments}
+
+
+class PlaceBRollRequest(BaseModel):
+    video_path: str
+    broll_directory: str
+    assignments: list  # [{start, end, clip_filename, clip_start_offset}]
+    output_directory: str = ""
+
+
+@app.post("/place-broll")
+async def place_broll(req: PlaceBRollRequest):
+    """Render video with b-roll clips placed at specified timestamps. SSE streaming."""
+    if not os.path.isfile(req.video_path):
+        return {"error": "Video file not found"}
+
+    # Filter to only assignments with a matched clip
+    placements = [a for a in req.assignments if a.get("clip_filename")]
+
+    if not placements:
+        return {"error": "No b-roll assignments to place"}
+
+    # Probe main video for dimensions and duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", req.video_path],
+        capture_output=True, text=True,
+    )
+    try:
+        info = json.loads(probe.stdout)
+        video_stream = next(s for s in info["streams"] if s["codec_type"] == "video")
+        W = int(video_stream["width"])
+        H = int(video_stream["height"])
+        total_dur = float(info["format"]["duration"])
+    except Exception:
+        return {"error": "Could not probe video dimensions"}
+
+    async def stream():
+        yield f"data: {json.dumps({'status': 'started', 'duration': total_dur, 'placements': len(placements)})}\n\n"
+
+        import time as _time
+        out_dir = req.output_directory or DEFAULT_OUTPUT_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        timestamp = _time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(out_dir, f"broll_placed_{timestamp}.mp4")
+        progress_path = tempfile.mktemp(suffix="_progress.log")
+
+        # Build ffmpeg command
+        inputs = ["-i", req.video_path]
+        for p in placements:
+            clip_path = os.path.join(req.broll_directory, p["clip_filename"])
+            inputs.extend(["-i", clip_path])
+
+        # Build filtergraph
+        filter_parts = []
+        # Start with the base video
+        filter_parts.append(f"[0:v]null[base]")
+
+        for i, p in enumerate(placements):
+            broll_dur = p["end"] - p["start"]
+            offset = p.get("clip_start_offset", 0)
+            input_idx = i + 1  # 0 is main video
+
+            filter_parts.append(
+                f"[{input_idx}:v]trim=start={offset:.3f}:duration={broll_dur:.3f},"
+                f"setpts=PTS-STARTPTS,"
+                f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
+                f"format=yuv420p[broll{i}]"
+            )
+
+        # Chain overlays
+        prev = "base"
+        for i, p in enumerate(placements):
+            out_label = f"outv" if i == len(placements) - 1 else f"tmp{i}"
+            filter_parts.append(
+                f"[{prev}][broll{i}]overlay=0:0:enable='between(t,{p['start']:.3f},{p['end']:.3f})'[{out_label}]"
+            )
+            prev = out_label
+
+        filter_complex = ";\n".join(filter_parts)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-progress", progress_path,
+            *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "0:a",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "320k",
+            "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        last_pct = -1
+        while True:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                with open(progress_path, "r") as f:
+                    content = f.read()
+                for line in reversed(content.split("\n")):
+                    if line.startswith("out_time_us="):
+                        us = int(line.split("=")[1])
+                        current_sec = us / 1_000_000
+                        pct = min(100, int((current_sec / total_dur) * 100))
+                        if pct != last_pct:
+                            last_pct = pct
+                            yield f"data: {json.dumps({'status': 'progress', 'percent': pct})}\n\n"
+                        break
+            except Exception:
+                pass
+
+            if proc.returncode is not None:
+                break
+
+        try:
+            os.unlink(progress_path)
+        except Exception:
+            pass
+
+        if proc.returncode != 0:
+            stderr = await proc.stderr.read()
+            yield f"data: {json.dumps({'status': 'error', 'error': f'FFmpeg failed: {stderr.decode()[-500:]}'})}\n\n"
+        else:
+            yield f"data: {json.dumps({'status': 'done', 'saved_path': output_path})}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 @app.post("/rotate-video")
 async def rotate_video(file: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -1136,7 +1996,8 @@ async def rotate_video(file: UploadFile = File(...)):
                 "ffmpeg", "-y", "-i", input_path,
                 "-c", "copy",
                 "-metadata:s:v:0", "rotate=90",
-                "-movflags", "+faststart",
+                "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                 output_path,
             ],
             capture_output=True, text=True,
@@ -1147,9 +2008,10 @@ async def rotate_video(file: UploadFile = File(...)):
                 [
                     "ffmpeg", "-y", "-i", input_path,
                     "-vf", "transpose=1",
-                    "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                    "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
                     "-c:a", "copy",
-                    "-movflags", "+faststart",
+                    "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
+            "-movflags", "+faststart",
                     output_path,
                 ],
                 capture_output=True, text=True, check=True,
@@ -1164,6 +2026,7 @@ async def rotate_video(file: UploadFile = File(...)):
         os.unlink(input_path)
 
 
+@app.head("/serve-video")
 @app.get("/serve-video")
 async def serve_video(path: str):
     if not os.path.isfile(path):

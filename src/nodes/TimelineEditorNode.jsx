@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Handle, Position, useNodeId, useReactFlow, useViewport } from '@xyflow/react';
+import { createPortal } from 'react-dom';
+import { Handle, Position, useNodeId, useReactFlow } from '@xyflow/react';
 import { Timeline } from '@xzdarcy/react-timeline-editor';
 import '@xzdarcy/react-timeline-editor/dist/react-timeline-editor.css';
 import { getNodeOutput, setNodeOutput, subscribe } from '../store';
-import GaplessPreview from './GaplessPreview';
+import RemotionPreview from './RemotionPreview';
 
 const CLIP_EFFECT = { clip: { id: 'clip', name: 'Clip' } };
 
@@ -43,8 +44,6 @@ function WaveformBar({ peaks, fullWidth }) {
 export default function TimelineEditorNode() {
   const nodeId = useNodeId();
   const { getEdges } = useReactFlow();
-  const { zoom: rfZoom } = useViewport();
-
   const [status, setStatus] = useState('idle');
   const [segments, setSegments] = useState([]); // original {start, end} from source video
   const [editorData, setEditorData] = useState([]); // timeline library format
@@ -457,77 +456,138 @@ export default function TimelineEditorNode() {
     );
   };
 
-  return (
-    <div
-      className="tl-node"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.code === 'Space') {
-          e.preventDefault();
-          e.stopPropagation();
-          togglePlay();
-        } else if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
-          e.preventDefault();
-          e.stopPropagation();
-          undo();
-        } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedActionId) {
-          e.preventDefault();
-          e.stopPropagation();
-          deleteSelected();
-        } else if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
-          e.preventDefault();
-          e.stopPropagation();
-          redo();
-        }
-      }}
-    >
-      <Handle type="target" position={Position.Left} />
+  const [modalOpen, setModalOpen] = useState(false);
 
-      <div className="tl-header">
-        <span className="tl-icon">✂️</span>
-        <span>Timeline Editor</span>
-        {status === 'ready' && (
-          <span className="tl-header-stats">
-            {editorData[0]?.actions?.length || 0} clips &middot; {formatTime(totalKept)}
-          </span>
-        )}
+  return (
+    <>
+      {/* Compact node */}
+      <div className="tl-node">
+        <Handle type="target" position={Position.Left} />
+
+        <div className="tl-header">
+          <span className="tl-icon">✂️</span>
+          <span>Timeline Editor</span>
+          {status === 'ready' && (
+            <span className="tl-header-stats">
+              {editorData[0]?.actions?.length || 0} clips &middot; {formatTime(totalKept)}
+            </span>
+          )}
+        </div>
+
+        <div className="tl-body nodrag nopan">
+          {status === 'idle' && (
+            <div className="tl-idle">
+              <span className="status-hint">Waiting for video...</span>
+              <input
+                className="save-node-dir"
+                type="text"
+                placeholder="Or paste video file path + Enter"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.target.value) detectSilences(e.target.value);
+                }}
+              />
+            </div>
+          )}
+
+          {status === 'detecting' && (
+            <div className="status-active" style={{ padding: 12 }}>
+              <span className="pulse-dot" /> Analyzing speech with Deepgram...
+            </div>
+          )}
+
+          {status === 'error' && (
+            <div className="status-error" style={{ padding: 12 }}>Detection failed</div>
+          )}
+
+          {status === 'ready' && (
+            <>
+              <button
+                className="btn btn-start"
+                style={{ width: '100%' }}
+                onClick={() => setModalOpen(true)}
+              >
+                Open Editor
+              </button>
+
+              {renderStatus === 'rendering' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <span className="status-active">
+                    <span className="pulse-dot" />
+                    {renderPct === 0 ? ' Preparing render...' : ` Rendering... ${renderPct}%`}
+                  </span>
+                  {renderPct > 0 && (
+                    <div className="syncmerge-progress-bar">
+                      <div className="syncmerge-progress-fill" style={{ width: `${renderPct}%` }} />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {renderStatus === 'done' && resultUrl && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <span className="status-done">Render complete</span>
+                  <a href={resultUrl} download="timeline_render.mp4" className="btn-download">
+                    Download
+                  </a>
+                </div>
+              )}
+
+              {renderStatus === 'error' && (
+                <span className="status-error">Render failed</span>
+              )}
+            </>
+          )}
+        </div>
+
+        <Handle type="source" position={Position.Right} />
       </div>
 
-      <div className="tl-body nodrag nopan">
-        {status === 'idle' && (
-          <div className="tl-idle">
-            <span className="status-hint">Waiting for video...</span>
-            <input
-              className="save-node-dir"
-              type="text"
-              placeholder="Or paste video file path + Enter"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && e.target.value) detectSilences(e.target.value);
-              }}
-            />
-          </div>
-        )}
+      {/* Full-screen modal editor */}
+      {modalOpen && createPortal(
+        <div
+          className="tl-modal-overlay"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              setModalOpen(false);
+            } else if (e.code === 'Space') {
+              e.preventDefault();
+              togglePlay();
+            } else if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+              e.preventDefault();
+              undo();
+            } else if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
+              e.preventDefault();
+              redo();
+            } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedActionId) {
+              e.preventDefault();
+              deleteSelected();
+            }
+          }}
+        >
+          <div className="tl-modal">
+            <div className="tl-modal-header">
+              <span>Timeline Editor</span>
+              <span className="tl-modal-stats">
+                {editorData[0]?.actions?.length || 0} clips &middot; {formatTime(totalKept)}
+              </span>
+              <button className="tl-modal-close" onClick={() => setModalOpen(false)}>
+                Close
+              </button>
+            </div>
 
-        {status === 'detecting' && (
-          <div className="status-active" style={{ padding: 12 }}>
-            <span className="pulse-dot" /> Analyzing speech with Deepgram...
-          </div>
-        )}
+            <div className="tl-modal-body">
+              {/* Video preview */}
+              <div className="tl-modal-preview">
+                <RemotionPreview
+                  ref={previewRef}
+                  videoUrl={`/serve-video?path=${encodeURIComponent(videoPath)}`}
+                  segments={editorDataToSegments(editorData)}
+                  onTimeUpdate={onPreviewTimeUpdate}
+                />
+              </div>
 
-        {status === 'error' && (
-          <div className="status-error" style={{ padding: 12 }}>Detection failed</div>
-        )}
-
-        {status === 'ready' && (
-          <>
-            {/* Video preview */}
-            <div className="tl-preview">
-              <GaplessPreview
-                ref={previewRef}
-                videoUrl={`http://localhost:8000/serve-video?path=${encodeURIComponent(videoPath)}`}
-                segments={editorDataToSegments(editorData)}
-                onTimeUpdate={onPreviewTimeUpdate}
-              />
+              {/* Transport */}
               <div className="tl-transport">
                 <button className="tl-transport-btn" onClick={togglePlay}>
                   {isPlaying ? '⏸' : '▶'}
@@ -543,115 +603,97 @@ export default function TimelineEditorNode() {
                   <button onClick={() => setScaleWidth((w) => Math.min(400, w + 20))}>+</button>
                 </div>
               </div>
-            </div>
 
-            {/* Padding control */}
-            <div className="tl-padding">
-              <label>Clip padding</label>
-              <input
-                type="range"
-                min="-0.5"
-                max="1"
-                step="0.05"
-                value={padding}
-                onChange={(e) => onPaddingChange(parseFloat(e.target.value))}
-              />
-              <span>{padding.toFixed(2)}s</span>
-            </div>
-
-            {/* Timeline */}
-            <div
-              className="tl-editor-wrap nowheel"
-              onWheel={(e) => {
-                if (e.metaKey || e.ctrlKey) {
-                  e.preventDefault();
-                  e.stopPropagation();
-
-                  const wrap = e.currentTarget;
-                  const rect = wrap.getBoundingClientRect();
-                  const cursorX = e.clientX - rect.left;
-                  const scrollLeft = wrap.scrollLeft || 0;
-                  const posInTrack = scrollLeft + cursorX;
-
-                  // Time under cursor at current scale
-                  const oldPxPerSec = scaleWidth / 5;
-                  const timeAtCursor = posInTrack / oldPxPerSec;
-
-                  const delta = e.deltaY > 0 ? -15 : 15;
-                  const newScaleWidth = Math.max(30, Math.min(400, scaleWidth + delta));
-                  setScaleWidth(newScaleWidth);
-
-                  // After zoom, adjust scroll so timeAtCursor stays under cursor
-                  const newPxPerSec = newScaleWidth / 5;
-                  const newPosInTrack = timeAtCursor * newPxPerSec;
-                  const newScrollLeft = newPosInTrack - cursorX;
-
-                  requestAnimationFrame(() => {
-                    if (timelineRef.current) {
-                      timelineRef.current.setScrollLeft(Math.max(0, newScrollLeft));
-                    }
-                  });
-                }
-              }}
-            >
-              <div style={{
-                width: `${100 * rfZoom}%`,
-                height: 100 * rfZoom,
-                transform: `scale(${1 / rfZoom})`,
-                transformOrigin: 'top left',
-              }}>
-              <Timeline
-                ref={timelineRef}
-                editorData={editorData}
-                effects={CLIP_EFFECT}
-                onChange={onTimelineChange}
-                onClickAction={onClickAction}
-                onActionResizeEnd={onActionResizeEnd}
-                onCursorDragEnd={onCursorDragEnd}
-                onClickTimeArea={onClickTimeArea}
-                getActionRender={getActionRender}
-                scale={5}
-                scaleWidth={scaleWidth}
-                rowHeight={50}
-                startLeft={10}
-                autoScroll
-                style={{ width: '100%', height: '100%' }}
-              />
+              {/* Padding control */}
+              <div className="tl-padding">
+                <label>Clip padding</label>
+                <input
+                  type="range"
+                  min="-0.3"
+                  max="0.3"
+                  step="0.01"
+                  value={padding}
+                  onChange={(e) => onPaddingChange(parseFloat(e.target.value))}
+                />
+                <span>{padding.toFixed(2)}s</span>
               </div>
+
+              {/* Timeline */}
+              <div
+                className="tl-editor-wrap"
+                onWheel={(e) => {
+                  if (e.metaKey || e.ctrlKey) {
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    const wrap = e.currentTarget;
+                    const rect = wrap.getBoundingClientRect();
+                    const cursorX = e.clientX - rect.left;
+                    const scrollLeft = wrap.scrollLeft || 0;
+                    const posInTrack = scrollLeft + cursorX;
+
+                    const oldPxPerSec = scaleWidth / 5;
+                    const timeAtCursor = posInTrack / oldPxPerSec;
+
+                    const delta = e.deltaY > 0 ? -15 : 15;
+                    const newScaleWidth = Math.max(30, Math.min(400, scaleWidth + delta));
+                    setScaleWidth(newScaleWidth);
+
+                    const newPxPerSec = newScaleWidth / 5;
+                    const newPosInTrack = timeAtCursor * newPxPerSec;
+                    const newScrollLeft = newPosInTrack - cursorX;
+
+                    requestAnimationFrame(() => {
+                      if (timelineRef.current) {
+                        timelineRef.current.setScrollLeft(Math.max(0, newScrollLeft));
+                      }
+                    });
+                  }
+                }}
+              >
+                <Timeline
+                  ref={timelineRef}
+                  editorData={editorData}
+                  effects={CLIP_EFFECT}
+                  onChange={onTimelineChange}
+                  onClickAction={onClickAction}
+                  onActionResizeEnd={onActionResizeEnd}
+                  onCursorDragEnd={onCursorDragEnd}
+                  onClickTimeArea={onClickTimeArea}
+                  getActionRender={getActionRender}
+                  scale={5}
+                  scaleWidth={scaleWidth}
+                  rowHeight={50}
+                  startLeft={10}
+                  autoScroll
+                  style={{ width: '100%', height: 120 }}
+                />
+              </div>
+
+              {/* Render */}
+              <div className="tl-modal-render-row">
+                <button
+                  className="btn btn-start tl-render-btn"
+                  onClick={renderTimeline}
+                  disabled={renderStatus === 'rendering' || (editorData[0]?.actions?.length || 0) === 0}
+                >
+                  {renderStatus === 'rendering' ? (renderPct === 0 ? 'Preparing render...' : `Rendering... ${renderPct}%`) : 'Render Video'}
+                </button>
+              </div>
+
+              {renderStatus === 'rendering' && (
+                <div className="syncmerge-progress-bar">
+                  <div className="syncmerge-progress-fill" style={{ width: `${renderPct}%` }} />
+                </div>
+              )}
+
+              {renderStatus === 'error' && (
+                <span className="status-error">Render failed</span>
+              )}
             </div>
-
-            {/* Render */}
-            <button
-              className="btn btn-start tl-render-btn"
-              onClick={renderTimeline}
-              disabled={renderStatus === 'rendering' || (editorData[0]?.actions?.length || 0) === 0}
-            >
-              {renderStatus === 'rendering' ? `Rendering... ${renderPct}%` : 'Render Video'}
-            </button>
-
-            {renderStatus === 'rendering' && (
-              <div className="syncmerge-progress-bar">
-                <div className="syncmerge-progress-fill" style={{ width: `${renderPct}%` }} />
-              </div>
-            )}
-
-            {renderStatus === 'done' && resultUrl && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <span className="status-done">Render complete</span>
-                <a href={resultUrl} download="timeline_render.mp4" className="btn-download">
-                  Download
-                </a>
-              </div>
-            )}
-
-            {renderStatus === 'error' && (
-              <span className="status-error">Render failed</span>
-            )}
-          </>
-        )}
-      </div>
-
-      <Handle type="source" position={Position.Right} />
-    </div>
+          </div>
+        </div>
+      , document.body)}
+    </>
   );
 }

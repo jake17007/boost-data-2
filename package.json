@@ -10,11 +10,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@remotion/media": "^4.0.443",
+    "@remotion/media-utils": "^4.0.443",
+    "@remotion/player": "^4.0.443",
+    "@twick/live-player": "^0.15.27",
+    "@twick/timeline": "^0.15.27",
+    "@twick/video-editor": "^0.15.27",
     "@xyflow/react": "^12.10.1",
     "@xzdarcy/react-timeline-editor": "^1.0.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "react-markdown": "^10.1.0"
+    "react-markdown": "^10.1.0",
+    "remotion": "^4.0.443"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",

@@ -25,6 +25,12 @@ import TimelineEditorNode from './nodes/TimelineEditorNode';
 import RotateVideoNode from './nodes/RotateVideoNode';
 import TimestampTranscriptNode from './nodes/TimestampTranscriptNode';
 import BRollNode from './nodes/BRollNode';
+import LoadVideoNode from './nodes/LoadVideoNode';
+import ReelMergeNode from './nodes/ReelMergeNode';
+import ReelTitlesNode from './nodes/ReelTitlesNode';
+import AnalyzeBRollNode from './nodes/AnalyzeBRollNode';
+import MatchBRollNode from './nodes/MatchBRollNode';
+import PlaceBRollNode from './nodes/PlaceBRollNode';
 import ClaudePanel from './ClaudePanel';
 
 const nodeTypes = {
@@ -42,6 +48,12 @@ const nodeTypes = {
   rotateVideo: RotateVideoNode,
   timestampTranscript: TimestampTranscriptNode,
   broll: BRollNode,
+  loadVideo: LoadVideoNode,
+  reelMerge: ReelMergeNode,
+  reelTitles: ReelTitlesNode,
+  analyzeBroll: AnalyzeBRollNode,
+  matchBroll: MatchBRollNode,
+  placeBroll: PlaceBRollNode,
 };
 
 const initialNodes = [
@@ -147,6 +159,102 @@ const initialNodes = [
     position: { x: 2350, y: 1200 },
     data: {},
   },
+  {
+    id: '18',
+    type: 'loadVideo',
+    position: { x: 900, y: 1200 },
+    data: {},
+  },
+  {
+    id: '19',
+    type: 'loadVideo',
+    position: { x: 100, y: 1600 },
+    data: {},
+  },
+  {
+    id: '20',
+    type: 'timelineEditor',
+    position: { x: 550, y: 1600 },
+    data: {},
+  },
+  {
+    id: '21',
+    type: 'saveVideo',
+    position: { x: 1050, y: 1600 },
+    data: {},
+  },
+  {
+    id: '22',
+    type: 'directoryLoader',
+    position: { x: 100, y: 2100 },
+    data: {},
+  },
+  {
+    id: '23',
+    type: 'reelMerge',
+    position: { x: 550, y: 2100 },
+    data: {},
+  },
+  {
+    id: '26',
+    type: 'saveVideo',
+    position: { x: 1050, y: 2100 },
+    data: {},
+  },
+  {
+    id: '24',
+    type: 'timelineEditor',
+    position: { x: 1550, y: 2100 },
+    data: {},
+  },
+  {
+    id: '25',
+    type: 'saveVideo',
+    position: { x: 2050, y: 2100 },
+    data: {},
+  },
+  {
+    id: '27',
+    type: 'reelTitles',
+    position: { x: 2550, y: 2100 },
+    data: {},
+  },
+  {
+    id: '28',
+    type: 'saveVideo',
+    position: { x: 3050, y: 2100 },
+    data: {},
+  },
+  {
+    id: '29',
+    type: 'directoryLoader',
+    position: { x: 2750, y: 1500 },
+    data: {},
+  },
+  {
+    id: '32',
+    type: 'analyzeBroll',
+    position: { x: 3200, y: 1500 },
+    data: {},
+  },
+  {
+    id: '33',
+    type: 'matchBroll',
+    position: { x: 3600, y: 1300 },
+    data: {},
+  },
+  {
+    id: '34',
+    type: 'placeBroll',
+    position: { x: 4100, y: 1100 },
+    data: {},
+  },
+  {
+    id: '31',
+    type: 'saveVideo',
+    position: { x: 4550, y: 1100 },
+    data: {},
+  },
 ];
 
 const initialEdges = [
@@ -164,6 +272,21 @@ const initialEdges = [
   { id: 'e14-15', source: '14', target: '15', animated: true },
   { id: 'e13-16', source: '13', target: '16', animated: true },
   { id: 'e16-17', source: '16', target: '17', animated: true },
+  { id: 'e18-12', source: '18', target: '12', animated: true },
+  { id: 'e19-20', source: '19', target: '20', animated: true },
+  { id: 'e20-21', source: '20', target: '21', animated: true },
+  { id: 'e22-23', source: '22', target: '23', animated: true },
+  { id: 'e23-26', source: '23', target: '26', animated: true },
+  { id: 'e26-24', source: '26', target: '24', animated: true },
+  { id: 'e24-25', source: '24', target: '25', animated: true },
+  { id: 'e25-27', source: '25', target: '27', animated: true },
+  { id: 'e27-28', source: '27', target: '28', animated: true },
+  { id: 'e29-32', source: '29', target: '32', animated: true },
+  { id: 'e32-33-analyses', source: '32', target: '33', targetHandle: 'analyses', animated: true },
+  { id: 'e17-33-suggestions', source: '17', target: '33', targetHandle: 'suggestions', animated: true },
+  { id: 'e15-34-video', source: '15', target: '34', targetHandle: 'video', animated: true },
+  { id: 'e33-34-assignments', source: '33', target: '34', targetHandle: 'assignments', animated: true },
+  { id: 'e34-31', source: '34', target: '31', animated: true },
 ];
 
 const API = 'http://localhost:8000';
@@ -199,8 +322,21 @@ export default function App() {
       .then((r) => r.json())
       .then((data) => {
         if (data && data.nodes) {
-          setNodes(data.nodes);
-          setEdges(data.edges || []);
+          // Merge: add new nodes/edges from code that aren't saved yet
+          // and weren't intentionally deleted by the user
+          const savedNodeIds = new Set(data.nodes.map((n) => n.id));
+          const savedEdgeIds = new Set((data.edges || []).map((e) => e.id));
+          const deletedIds = new Set(data.deleted || []);
+          const mergedNodes = [
+            ...data.nodes,
+            ...initialNodes.filter((n) => !savedNodeIds.has(n.id) && !deletedIds.has(n.id)),
+          ];
+          const mergedEdges = [
+            ...(data.edges || []),
+            ...initialEdges.filter((e) => !savedEdgeIds.has(e.id) && !deletedIds.has(e.id)),
+          ];
+          setNodes(mergedNodes);
+          setEdges(mergedEdges);
         } else {
           setNodes(initialNodes);
           setEdges(initialEdges);
