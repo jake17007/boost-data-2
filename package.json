@@ -10,9 +10,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@remotion/bundler": "^4.0.443",
     "@remotion/media": "^4.0.443",
     "@remotion/media-utils": "^4.0.443",
     "@remotion/player": "^4.0.443",
+    "@remotion/renderer": "^4.0.443",
     "@twick/live-player": "^0.15.27",
     "@twick/timeline": "^0.15.27",
     "@twick/video-editor": "^0.15.27",

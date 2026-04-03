@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import urllib.parse
 import audalign as ad
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -2060,17 +2061,16 @@ class PlaceBRollRequest(BaseModel):
     broll_directory: str
     assignments: list  # [{start, end, clip_filename, clip_start_offset}]
     output_directory: str = ""
+    broll_volume: float = 0.15
 
 
 @app.post("/place-broll")
 async def place_broll(req: PlaceBRollRequest):
-    """Render video with b-roll clips placed at specified timestamps. SSE streaming."""
+    """Render video with b-roll clips using Remotion (same composition as preview). SSE streaming."""
     if not os.path.isfile(req.video_path):
         return {"error": "Video file not found"}
 
-    # Filter to only assignments with a matched clip
     placements = [a for a in req.assignments if a.get("clip_filename")]
-
     if not placements:
         return {"error": "No b-roll assignments to place"}
 
@@ -2096,97 +2096,90 @@ async def place_broll(req: PlaceBRollRequest):
         os.makedirs(out_dir, exist_ok=True)
         timestamp = _time.strftime("%Y%m%d_%H%M%S")
         output_path = os.path.join(out_dir, f"broll_placed_{timestamp}.mp4")
-        progress_path = tempfile.mktemp(suffix="_progress.log")
 
-        # Build ffmpeg command
-        inputs = ["-i", req.video_path]
+        # Build Remotion render config — uses the same composition as the preview
+        # Video URLs use the local server so Remotion's browser can fetch them
+        base_url = "http://localhost:8000"
+        main_video_url = f"{base_url}/serve-video?path={urllib.parse.quote(req.video_path)}"
+
+        broll_actions = []
         for p in placements:
             clip_path = os.path.join(req.broll_directory, p["clip_filename"])
-            inputs.extend(["-i", clip_path])
+            broll_actions.append({
+                "id": f"broll-{len(broll_actions)}",
+                "start": p["start"],
+                "end": p["end"],
+                "_clipUrl": f"{base_url}/serve-video?path={urllib.parse.quote(clip_path)}",
+                "_clipStartOffset": p.get("clip_start_offset", 0),
+            })
 
-        # Build filtergraph
-        filter_parts = []
-        # Start with the base video
-        filter_parts.append(f"[0:v]null[base]")
+        render_config = {
+            "mainVideoUrl": main_video_url,
+            "brollActions": broll_actions,
+            "totalDuration": total_dur,
+            "compositionWidth": W,
+            "compositionHeight": H,
+            "brollVolume": req.broll_volume,
+            "outputPath": output_path,
+        }
 
-        for i, p in enumerate(placements):
-            broll_dur = p["end"] - p["start"]
-            offset = p.get("clip_start_offset", 0)
-            input_idx = i + 1  # 0 is main video
+        # Write config to temp file
+        config_path = tempfile.mktemp(suffix="_remotion_config.json")
+        with open(config_path, "w") as f:
+            json.dump(render_config, f)
 
-            filter_parts.append(
-                f"[{input_idx}:v]trim=start={offset:.3f}:duration={broll_dur:.3f},"
-                f"setpts=PTS-STARTPTS,"
-                f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
-                f"format=yuv420p[broll{i}]"
-            )
+        # Log the config for debugging
+        print(f"[place-broll] Config path: {config_path}")
+        print(f"[place-broll] Output path: {output_path}")
+        print(f"[place-broll] Main video: {main_video_url}")
+        print(f"[place-broll] B-roll actions: {json.dumps(broll_actions, indent=2)}")
+        print(f"[place-broll] Total duration: {total_dur}, Dimensions: {W}x{H}")
 
-        # Chain overlays
-        prev = "base"
-        for i, p in enumerate(placements):
-            out_label = f"outv" if i == len(placements) - 1 else f"tmp{i}"
-            filter_parts.append(
-                f"[{prev}][broll{i}]overlay=0:0:enable='between(t,{p['start']:.3f},{p['end']:.3f})'[{out_label}]"
-            )
-            prev = out_label
-
-        filter_complex = ";\n".join(filter_parts)
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-progress", progress_path,
-            *inputs,
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "0:a",
-            "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "320k",
-            "-metadata", f"creation_time={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')}",
-            "-movflags", "+faststart",
-            output_path,
-        ]
+        # Find the render script relative to the server
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "render-broll.mjs")
+        print(f"[place-broll] Render script: {script_path}")
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+            "node", script_path, config_path,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        last_pct = -1
+        # Read stdout line by line for progress JSON
         while True:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=0.5)
-            except asyncio.TimeoutError:
-                pass
-
-            try:
-                with open(progress_path, "r") as f:
-                    content = f.read()
-                for line in reversed(content.split("\n")):
-                    if line.startswith("out_time_us="):
-                        us = int(line.split("=")[1])
-                        current_sec = us / 1_000_000
-                        pct = min(100, int((current_sec / total_dur) * 100))
-                        if pct != last_pct:
-                            last_pct = pct
-                            yield f"data: {json.dumps({'status': 'progress', 'percent': pct})}\n\n"
-                        break
-            except Exception:
-                pass
-
-            if proc.returncode is not None:
+            line = await proc.stdout.readline()
+            if not line:
                 break
+            line = line.decode().strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if data.get("status") == "progress":
+                    yield f"data: {json.dumps({'status': 'progress', 'percent': data['percent']})}\n\n"
+                elif data.get("status") == "done":
+                    yield f"data: {json.dumps({'status': 'done', 'saved_path': output_path})}\n\n"
+                elif data.get("status") == "error":
+                    yield f"data: {json.dumps({'status': 'error', 'error': data['error']})}\n\n"
+            except json.JSONDecodeError:
+                pass
 
+        await proc.wait()
+
+        stderr_out = await proc.stderr.read()
+        if stderr_out:
+            print(f"[place-broll] Node stderr:\n{stderr_out.decode()[-2000:]}")
+
+        print(f"[place-broll] Node exit code: {proc.returncode}")
+
+        # Clean up config file
         try:
-            os.unlink(progress_path)
+            os.unlink(config_path)
         except Exception:
             pass
 
-        if proc.returncode != 0:
-            stderr = await proc.stderr.read()
-            yield f"data: {json.dumps({'status': 'error', 'error': f'FFmpeg failed: {stderr.decode()[-500:]}'})}\n\n"
-        else:
-            yield f"data: {json.dumps({'status': 'done', 'saved_path': output_path})}\n\n"
+        if proc.returncode != 0 and proc.returncode is not None:
+            yield f"data: {json.dumps({'status': 'error', 'error': f'Remotion render failed: {stderr_out.decode()[-500:]}'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

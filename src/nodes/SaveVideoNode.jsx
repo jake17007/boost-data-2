@@ -23,6 +23,22 @@ export default function SaveVideoNode() {
     return incoming?.source ?? null;
   }, [getEdges, nodeId]);
 
+  // Restore last output to store on mount (so downstream nodes have data on refresh)
+  useEffect(() => {
+    if (!nodeId) return;
+    (async () => {
+      try {
+        const res = await fetch(`http://localhost:8000/node-data/load?node_id=${nodeId}`);
+        const saved = await res.json();
+        if (saved.found && saved.data?.savedPath) {
+          setSavedPath(saved.data.savedPath);
+          processedBlobRef.current = saved.data.savedPath;
+          setNodeOutput(nodeId, { savedPath: saved.data.savedPath });
+        }
+      } catch (_) {}
+    })();
+  }, [nodeId]);
+
   // Load saved files on mount
   useEffect(() => {
     fetch(`http://localhost:8000/saved-videos${directory ? `?directory=${encodeURIComponent(directory)}` : ''}`)
@@ -49,6 +65,12 @@ export default function SaveVideoNode() {
       setSavedPath(data.path);
       setNodeOutput(nodeId, { savedPath: data.path });
       setStatus('done');
+      // Persist to DB so downstream nodes have data on refresh
+      fetch('http://localhost:8000/node-data/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nodeId, data: { savedPath: data.path } }),
+      }).catch(() => {});
     } catch (err) {
       console.error('Save failed:', err);
       setStatus('error');
@@ -65,6 +87,23 @@ export default function SaveVideoNode() {
       if (data?.videoBlob && data.videoBlob !== processedBlobRef.current) {
         processedBlobRef.current = data.videoBlob;
         saveVideo(data.videoBlob);
+      } else if (data?.savedPath && data.savedPath !== processedBlobRef.current) {
+        // Upstream already saved the file — just update our state and refresh the list
+        processedBlobRef.current = data.savedPath;
+        setSavedPath(data.savedPath);
+        setNodeOutput(nodeId, { savedPath: data.savedPath });
+        fetch('http://localhost:8000/node-data/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_id: nodeId, data: { savedPath: data.savedPath } }),
+        }).catch(() => {});
+        // Refresh file list
+        if (directory) {
+          fetch(`http://localhost:8000/saved-videos?directory=${encodeURIComponent(directory)}`)
+            .then((r) => r.json())
+            .then((d) => { if (d.videos) setVideos(d.videos); })
+            .catch(() => {});
+        }
       }
     };
     check();

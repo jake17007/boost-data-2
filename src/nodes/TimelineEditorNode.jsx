@@ -5,50 +5,9 @@ import { Timeline } from '@xzdarcy/react-timeline-editor';
 import '@xzdarcy/react-timeline-editor/dist/react-timeline-editor.css';
 import { getNodeOutput, setNodeOutput, subscribe } from '../store';
 import RemotionPreview from './RemotionPreview';
+import WaveformBar from './WaveformBar';
 
 const CLIP_EFFECT = { clip: { id: 'clip', name: 'Clip' } };
-
-function WaveformBar({ peaks, fullWidth }) {
-  if (!peaks.length) return null;
-
-  const w = peaks.length;
-  const h = 100;
-  const mid = h / 2;
-  const isMinMax = Array.isArray(peaks[0]);
-
-  // Ableton-style: one vertical line per sample, from min to max.
-  // Built as a single SVG path with M (move) and V (vertical line) commands.
-  let pathD = '';
-  for (let i = 0; i < peaks.length; i++) {
-    let yMin, yMax;
-    if (isMinMax) {
-      yMax = mid - peaks[i][1] * mid * 0.95; // top (max goes up)
-      yMin = mid - peaks[i][0] * mid * 0.95; // bottom (min goes down)
-    } else {
-      const v = peaks[i] * mid * 0.95;
-      yMax = mid - v;
-      yMin = mid + v;
-    }
-    pathD += `M${i} ${yMax}V${yMin}`;
-  }
-
-  return (
-    <svg
-      className="tl-waveform-canvas"
-      viewBox={`0 0 ${w} ${h}`}
-      preserveAspectRatio="none"
-      style={{ width: fullWidth, height: '100%' }}
-    >
-      <path
-        d={pathD}
-        stroke="rgba(255, 255, 255, 0.7)"
-        strokeWidth="1"
-        fill="none"
-        vectorEffect="non-scaling-stroke"
-      />
-    </svg>
-  );
-}
 
 export default function TimelineEditorNode() {
   const nodeId = useNodeId();

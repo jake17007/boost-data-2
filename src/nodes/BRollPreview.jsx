@@ -1,50 +1,10 @@
 import { forwardRef, useImperativeHandle, useRef, useMemo, useEffect } from 'react';
 import { Player } from '@remotion/player';
-import { OffthreadVideo, AbsoluteFill, Sequence } from 'remotion';
+import BRollComposition from '../remotion/BRollComposition';
 
 const FPS = 30;
 
-/**
- * Remotion composition: main video on bottom, b-roll clips layered on top.
- * B-roll clips appear at their assigned timeline positions.
- */
-const BRollComposition = ({ mainVideoUrl, brollActions, fps }) => {
-  return (
-    <AbsoluteFill style={{ background: '#000' }}>
-      {/* Base layer: main video */}
-      <AbsoluteFill>
-        <OffthreadVideo
-          src={mainVideoUrl}
-          pauseWhenBuffering
-          style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-        />
-      </AbsoluteFill>
-
-      {/* B-roll overlay layers */}
-      {brollActions.map((action) => {
-        const from = Math.round(action.start * fps);
-        const dur = Math.round((action.end - action.start) * fps);
-        const trimBefore = Math.round((action._clipStartOffset || 0) * fps);
-        if (dur <= 0) return null;
-
-        return (
-          <Sequence key={action.id} from={from} durationInFrames={dur} premountFor={30}>
-            <AbsoluteFill>
-              <OffthreadVideo
-                src={action._clipUrl}
-                trimBefore={trimBefore}
-                pauseWhenBuffering
-                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-              />
-            </AbsoluteFill>
-          </Sequence>
-        );
-      })}
-    </AbsoluteFill>
-  );
-};
-
-const BRollPreview = forwardRef(({ mainVideoUrl, brollActions, totalDuration, onTimeUpdate, compositionWidth = 1920, compositionHeight = 1080 }, ref) => {
+const BRollPreview = forwardRef(({ mainVideoUrl, brollActions, totalDuration, onTimeUpdate, compositionWidth = 1920, compositionHeight = 1080, brollVolume = 0.15 }, ref) => {
   const playerRef = useRef(null);
 
   const totalFrames = Math.max(1, Math.round((totalDuration || 30) * FPS));
@@ -54,8 +14,8 @@ const BRollPreview = forwardRef(({ mainVideoUrl, brollActions, totalDuration, on
   const stableActions = useMemo(() => brollActions || [], [actionsKey]);
 
   const inputProps = useMemo(
-    () => ({ mainVideoUrl, brollActions: stableActions, fps: FPS }),
-    [mainVideoUrl, stableActions]
+    () => ({ mainVideoUrl, brollActions: stableActions, fps: FPS, brollVolume }),
+    [mainVideoUrl, stableActions, brollVolume]
   );
 
   useEffect(() => {
