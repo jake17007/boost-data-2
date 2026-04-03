@@ -31,6 +31,7 @@ import ReelTitlesNode from './nodes/ReelTitlesNode';
 import AnalyzeBRollNode from './nodes/AnalyzeBRollNode';
 import MatchBRollNode from './nodes/MatchBRollNode';
 import PlaceBRollNode from './nodes/PlaceBRollNode';
+import BRollTimelineNode from './nodes/BRollTimelineNode';
 import ClaudePanel from './ClaudePanel';
 
 const nodeTypes = {
@@ -54,6 +55,7 @@ const nodeTypes = {
   analyzeBroll: AnalyzeBRollNode,
   matchBroll: MatchBRollNode,
   placeBroll: PlaceBRollNode,
+  brollTimeline: BRollTimelineNode,
 };
 
 const initialNodes = [
@@ -133,18 +135,6 @@ const initialNodes = [
     id: '13',
     type: 'saveVideo',
     position: { x: 1750, y: 700 },
-    data: {},
-  },
-  {
-    id: '14',
-    type: 'rotateVideo',
-    position: { x: 2150, y: 700 },
-    data: {},
-  },
-  {
-    id: '15',
-    type: 'saveVideo',
-    position: { x: 2550, y: 700 },
     data: {},
   },
   {
@@ -245,7 +235,7 @@ const initialNodes = [
   },
   {
     id: '34',
-    type: 'placeBroll',
+    type: 'brollTimeline',
     position: { x: 4100, y: 1100 },
     data: {},
   },
@@ -268,8 +258,6 @@ const initialEdges = [
   { id: 'e10-11', source: '10', target: '11', animated: true },
   { id: 'e11-12', source: '11', target: '12', animated: true },
   { id: 'e12-13', source: '12', target: '13', animated: true },
-  { id: 'e13-14', source: '13', target: '14', animated: true },
-  { id: 'e14-15', source: '14', target: '15', animated: true },
   { id: 'e13-16', source: '13', target: '16', animated: true },
   { id: 'e16-17', source: '16', target: '17', animated: true },
   { id: 'e18-12', source: '18', target: '12', animated: true },
@@ -284,7 +272,7 @@ const initialEdges = [
   { id: 'e29-32', source: '29', target: '32', animated: true },
   { id: 'e32-33-analyses', source: '32', target: '33', targetHandle: 'analyses', animated: true },
   { id: 'e17-33-suggestions', source: '17', target: '33', targetHandle: 'suggestions', animated: true },
-  { id: 'e15-34-video', source: '15', target: '34', targetHandle: 'video', animated: true },
+  { id: 'e13-34-video', source: '13', target: '34', targetHandle: 'video', animated: true },
   { id: 'e33-34-assignments', source: '33', target: '34', targetHandle: 'assignments', animated: true },
   { id: 'e34-31', source: '34', target: '31', animated: true },
 ];

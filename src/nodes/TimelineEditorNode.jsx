@@ -226,6 +226,8 @@ export default function TimelineEditorNode() {
           setSegments(editorDataToSegments(data.editor_data));
           setRotation(data.rotation || 0);
           setPadding(data.padding || 0);
+          if (data.canvas_width) setCanvasWidth(data.canvas_width);
+          if (data.canvas_height) setCanvasHeight(data.canvas_height);
           if (data.video_path) {
             setVideoPath(data.video_path);
             processedRef.current = data.video_path;
@@ -261,11 +263,13 @@ export default function TimelineEditorNode() {
           editor_data: editorData,
           rotation,
           padding,
+          canvas_width: canvasWidth,
+          canvas_height: canvasHeight,
         }),
       }).catch(() => {});
     }, 1000);
     return () => { if (autosaveTimer.current) clearTimeout(autosaveTimer.current); };
-  }, [nodeId, editorData, rotation, padding, videoPath]);
+  }, [nodeId, editorData, rotation, padding, videoPath, canvasWidth, canvasHeight]);
 
   useEffect(() => {
     const check = () => {
@@ -489,6 +493,9 @@ export default function TimelineEditorNode() {
         body: JSON.stringify({
           video_path: videoPath,
           segments: segs.map((s) => ({ start: s.start, end: s.end })),
+          rotation,
+          canvas_width: canvasWidth,
+          canvas_height: canvasHeight,
         }),
       });
 

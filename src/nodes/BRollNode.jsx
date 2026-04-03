@@ -63,6 +63,27 @@ export default function BRollNode() {
     localStorage.setItem(`broll-prompt-${nodeId}`, val);
   };
 
+  // Load saved data on mount
+  useEffect(() => {
+    if (!nodeId) return;
+    (async () => {
+      try {
+        const res = await fetch(`http://localhost:8000/node-data/load?node_id=${nodeId}`);
+        const saved = await res.json();
+        if (saved.found && saved.data) {
+          if (saved.data.suggestions) {
+            setSuggestions(saved.data.suggestions);
+            setStatus('done');
+          }
+          if (saved.data.rawText) setRawText(saved.data.rawText);
+          if (saved.data.suggestions) {
+            setNodeOutput(nodeId, { brollSuggestions: saved.data.suggestions, brollRaw: saved.data.rawText || '' });
+          }
+        }
+      } catch (_) {}
+    })();
+  }, [nodeId]);
+
   // Listen for upstream transcript (but don't auto-generate)
   useEffect(() => {
     const check = () => {
@@ -102,6 +123,15 @@ export default function BRollNode() {
       setRawText(data.raw);
       setNodeOutput(nodeId, { brollSuggestions: data.suggestions, brollRaw: data.raw });
       setStatus('done');
+      // Save to DB
+      fetch('http://localhost:8000/node-data/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          node_id: nodeId,
+          data: { suggestions: data.suggestions, rawText: data.raw },
+        }),
+      }).catch(() => {});
     } catch (err) {
       console.error('B-roll suggestions failed:', err);
       setStatus('error');

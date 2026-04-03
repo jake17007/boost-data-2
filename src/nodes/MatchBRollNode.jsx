@@ -24,6 +24,27 @@ export default function MatchBRollNode() {
   const [status, setStatus] = useState('idle');
   const [assignments, setAssignments] = useState([]);
 
+  // Load saved data on mount
+  useEffect(() => {
+    if (!nodeId) return;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/node-data/load?node_id=${nodeId}`);
+        const saved = await res.json();
+        if (saved.found && saved.data) {
+          if (saved.data.assignments) {
+            setAssignments(saved.data.assignments);
+            setStatus('done');
+          }
+          if (saved.data.directory) setBrollDirectory(saved.data.directory);
+          if (saved.data.assignments && saved.data.directory) {
+            setNodeOutput(nodeId, { assignments: saved.data.assignments, directory: saved.data.directory });
+          }
+        }
+      } catch (_) {}
+    })();
+  }, [nodeId]);
+
   // Two inputs: analyses (from AnalyzeBRollNode) and suggestions (from BRollNode)
   useEffect(() => {
     const check = () => {
@@ -61,6 +82,15 @@ export default function MatchBRollNode() {
       setAssignments(data.assignments);
       setNodeOutput(nodeId, { assignments: data.assignments, directory: brollDirectory });
       setStatus('done');
+      // Save to DB
+      fetch(`${API}/node-data/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          node_id: nodeId,
+          data: { assignments: data.assignments, directory: brollDirectory },
+        }),
+      }).catch(() => {});
     } catch (err) {
       console.error('Match clips failed:', err);
       setStatus('error');
@@ -71,6 +101,15 @@ export default function MatchBRollNode() {
     const updated = assignments.map((a, i) => (i === idx ? { ...a, [field]: value } : a));
     setAssignments(updated);
     setNodeOutput(nodeId, { assignments: updated, directory: brollDirectory });
+    // Save to DB
+    fetch(`${API}/node-data/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        node_id: nodeId,
+        data: { assignments: updated, directory: brollDirectory },
+      }),
+    }).catch(() => {});
   };
 
   const removeAssignment = (idx) => {

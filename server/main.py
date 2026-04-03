@@ -411,6 +411,8 @@ def _get_db():
             editor_data TEXT NOT NULL DEFAULT '[]',
             rotation REAL NOT NULL DEFAULT 0,
             padding REAL NOT NULL DEFAULT 0,
+            canvas_width INTEGER NOT NULL DEFAULT 1920,
+            canvas_height INTEGER NOT NULL DEFAULT 1080,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
@@ -557,6 +559,8 @@ class TimelineSaveRequest(BaseModel):
     editor_data: list
     rotation: float = 0
     padding: float = 0
+    canvas_width: int = 1920
+    canvas_height: int = 1080
 
 
 @app.post("/timeline/save")
@@ -567,15 +571,17 @@ async def timeline_save(req: TimelineSaveRequest):
 
     # Upsert current state
     db.execute("""
-        INSERT INTO timeline_edits (node_id, video_path, editor_data, rotation, padding, updated_at)
-        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO timeline_edits (node_id, video_path, editor_data, rotation, padding, canvas_width, canvas_height, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(node_id) DO UPDATE SET
             video_path = excluded.video_path,
             editor_data = excluded.editor_data,
             rotation = excluded.rotation,
             padding = excluded.padding,
+            canvas_width = excluded.canvas_width,
+            canvas_height = excluded.canvas_height,
             updated_at = datetime('now')
-    """, (req.node_id, req.video_path, data_json, req.rotation, req.padding))
+    """, (req.node_id, req.video_path, data_json, req.rotation, req.padding, req.canvas_width, req.canvas_height))
 
     # Save version (keep last 100 per node)
     db.execute("""
@@ -600,7 +606,7 @@ async def timeline_load(node_id: str):
     """Load the latest saved timeline edit state."""
     db = _get_db()
     row = db.execute(
-        "SELECT video_path, editor_data, rotation, padding FROM timeline_edits WHERE node_id = ?",
+        "SELECT video_path, editor_data, rotation, padding, canvas_width, canvas_height FROM timeline_edits WHERE node_id = ?",
         (node_id,)
     ).fetchone()
     db.close()
@@ -614,6 +620,8 @@ async def timeline_load(node_id: str):
         "editor_data": json.loads(row["editor_data"]),
         "rotation": row["rotation"],
         "padding": row["padding"],
+        "canvas_width": row["canvas_width"],
+        "canvas_height": row["canvas_height"],
     }
 
 
@@ -645,6 +653,53 @@ async def timeline_version(version_id: int):
         "rotation": row["rotation"],
         "padding": row["padding"],
     }
+
+
+# ── Generic Node Data Persistence ──────────────────────────────────────────────
+# Any node can save/load arbitrary JSON data keyed by node_id.
+
+class NodeDataSaveRequest(BaseModel):
+    node_id: str
+    data: dict
+
+
+@app.post("/node-data/save")
+async def node_data_save(req: NodeDataSaveRequest):
+    db = _get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS node_data (
+            node_id TEXT PRIMARY KEY,
+            data TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    db.execute("""
+        INSERT INTO node_data (node_id, data, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(node_id) DO UPDATE SET
+            data = excluded.data,
+            updated_at = datetime('now')
+    """, (req.node_id, json.dumps(req.data)))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/node-data/load")
+async def node_data_load(node_id: str):
+    db = _get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS node_data (
+            node_id TEXT PRIMARY KEY,
+            data TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    row = db.execute("SELECT data FROM node_data WHERE node_id = ?", (node_id,)).fetchone()
+    db.close()
+    if not row:
+        return {"found": False}
+    return {"found": True, "data": json.loads(row["data"])}
 
 
 def _conv_path(conv_id: str) -> str:
@@ -1350,6 +1405,9 @@ async def detect_silences(req: DetectSilenceRequest):
 class RenderTimelineRequest(BaseModel):
     video_path: str
     segments: list  # list of {"start": float, "end": float}
+    rotation: float = 0
+    canvas_width: int = 0  # 0 = use source dimensions
+    canvas_height: int = 0
 
 
 @app.post("/render-timeline")
@@ -1369,7 +1427,7 @@ async def render_timeline(req: RenderTimelineRequest):
         output_path = tempfile.mktemp(suffix="_timeline.mp4")
         progress_path = tempfile.mktemp(suffix="_progress.log")
 
-        # Build filter_complex to concat segments
+        # Build filter_complex to concat segments + apply rotation/canvas
         filter_parts = []
         for i, seg in enumerate(req.segments):
             filter_parts.append(
@@ -1378,7 +1436,32 @@ async def render_timeline(req: RenderTimelineRequest):
             )
         concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(req.segments)))
         filter_parts.append(f"{concat_inputs}concat=n={len(req.segments)}:v=1:a=1[outv][outa];")
-        filter_parts.append("[outv]setsar=1[outvs]")
+
+        # Apply rotation if set
+        rot = req.rotation % 360
+        if rot == 90:
+            filter_parts.append("[outv]transpose=1[outv2];")
+        elif rot == 180:
+            filter_parts.append("[outv]transpose=1,transpose=1[outv2];")
+        elif rot == 270:
+            filter_parts.append("[outv]transpose=2[outv2];")
+        else:
+            filter_parts.append("[outv]null[outv2];")
+
+        # Apply canvas size if specified (scale + pad to fit)
+        if req.canvas_width > 0 and req.canvas_height > 0:
+            cw = req.canvas_width
+            ch = req.canvas_height
+            # Make dimensions even (required by libx264)
+            cw = cw if cw % 2 == 0 else cw + 1
+            ch = ch if ch % 2 == 0 else ch + 1
+            filter_parts.append(
+                f"[outv2]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
+                f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[outvs]"
+            )
+        else:
+            filter_parts.append("[outv2]setsar=1[outvs]")
+
         filter_complex = "".join(filter_parts)
 
         cmd = [
@@ -1798,12 +1881,14 @@ async def analyze_broll_clips(req: AnalyzeBRollRequest):
 
     async def stream():
         yield f"data: {json.dumps({'status': 'started', 'total': len(clips)})}\n\n"
+        await asyncio.sleep(0)  # flush
 
         for idx, clip in enumerate(clips):
-            yield f"data: {json.dumps({'status': 'analyzing', 'index': idx, 'filename': clip['filename']})}\n\n"
+            yield f"data: {json.dumps({'status': 'analyzing', 'index': idx, 'filename': clip['filename'], 'total': len(clips)})}\n\n"
+            await asyncio.sleep(0)  # flush
 
-            # Get duration via ffprobe
-            probe = subprocess.run(
+            # Get duration via ffprobe (run in thread to avoid blocking)
+            probe = await asyncio.to_thread(subprocess.run,
                 ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", clip["path"]],
                 capture_output=True, text=True,
             )
@@ -1817,7 +1902,7 @@ async def analyze_broll_clips(req: AnalyzeBRollRequest):
             # Extract frames every 2 seconds
             frames_dir = tempfile.mkdtemp(prefix="broll_frames_")
             try:
-                subprocess.run(
+                await asyncio.to_thread(subprocess.run,
                     [
                         "ffmpeg", "-y", "-i", clip["path"],
                         "-vf", "fps=0.5,scale=512:-1",
@@ -1853,16 +1938,20 @@ async def analyze_broll_clips(req: AnalyzeBRollRequest):
                     })
 
                 # Call Claude Vision
-                message = claude.messages.create(
+                message = await asyncio.to_thread(claude.messages.create,
                     model="claude-sonnet-4-20250514",
                     max_tokens=2048,
                     messages=[{"role": "user", "content": content_parts}],
                 )
 
                 response_text = message.content[0].text
+                input_tokens = message.usage.input_tokens
+                output_tokens = message.usage.output_tokens
+                # Pricing: Claude Sonnet ~$3/M input, $15/M output
+                clip_cost = (input_tokens * 3 + output_tokens * 15) / 1_000_000
+
                 # Parse JSON from response
                 try:
-                    # Find JSON in the response
                     json_start = response_text.index("{")
                     json_end = response_text.rindex("}") + 1
                     parsed = json.loads(response_text[json_start:json_end])
@@ -1879,6 +1968,8 @@ async def analyze_broll_clips(req: AnalyzeBRollRequest):
                         "description": response_text,
                         "segments": [],
                     })
+
+                yield f"data: {json.dumps({'status': 'clip_done', 'index': idx, 'filename': clip['filename'], 'input_tokens': input_tokens, 'output_tokens': output_tokens, 'cost': round(clip_cost, 4), 'analysis': analyses[-1]})}\n\n"
 
             finally:
                 # Clean up frames
